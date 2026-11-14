@@ -1,5 +1,8 @@
 //! WebSocket client configuration.
 
+use crate::tls::Certificate;
+#[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
+use crate::tls::TlsConnector;
 use derive_builder::Builder;
 use std::time::Duration;
 
@@ -103,9 +106,40 @@ pub struct WebSocketConfig {
     /// hostname) — intended for development and testing against self-signed
     /// certificates only. Has no effect on plain `ws://` connections.
     ///
+    /// Works with every TLS backend.
+    ///
     /// Default is false (full verification against the system CA store).
     #[builder(default = "false")]
+    #[cfg_attr(
+        not(any(feature = "native-tls", feature = "rustls-platform-verifier")),
+        allow(dead_code)
+    )]
     pub(crate) danger_accept_invalid_certs: bool,
+
+    /// Additional trusted root certificates for `wss://` connections, on top of the
+    /// system CA store.
+    ///
+    /// Use it for a private certificate authority or the self-signed certificate of a
+    /// server. See also [`WebSocketConfigBuilder::add_root_certificate`].
+    ///
+    /// Default is empty.
+    #[builder(default)]
+    #[cfg_attr(
+        not(any(feature = "native-tls", feature = "rustls-platform-verifier")),
+        allow(dead_code)
+    )]
+    pub(crate) root_certificates: Vec<Certificate>,
+
+    /// A ready-made TLS configuration for `wss://` connections.
+    ///
+    /// Replaces the connector the client builds itself, for full control over the TLS
+    /// setup (client certificates, protocol versions, a custom verifier, ...). Cannot
+    /// be combined with `danger_accept_invalid_certs` or `root_certificates`.
+    ///
+    /// Default is `None`.
+    #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
+    #[builder(default)]
+    pub(crate) tls_connector: Option<TlsConnector>,
 
     /// Log every received text message at debug level.
     ///
@@ -129,6 +163,15 @@ impl WebSocketConfig {
 }
 
 impl WebSocketConfigBuilder {
+    /// Adds a trusted root certificate for `wss://` connections, see
+    /// `root_certificates`.
+    pub fn add_root_certificate(mut self, certificate: Certificate) -> Self {
+        self.root_certificates
+            .get_or_insert_with(Vec::new)
+            .push(certificate);
+        self
+    }
+
     fn validate(&self) -> Result<(), String> {
         if let Some(factor) = self.backoff_factor
             && (factor < 1.0 || !factor.is_finite())
@@ -149,6 +192,19 @@ impl WebSocketConfigBuilder {
             && initial.is_zero()
         {
             return Err("initial_backoff must be > 0".into());
+        }
+        #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
+        if matches!(self.tls_connector, Some(Some(_)))
+            && (self.danger_accept_invalid_certs == Some(true)
+                || self
+                    .root_certificates
+                    .as_ref()
+                    .is_some_and(|c| !c.is_empty()))
+        {
+            return Err(
+                "tls_connector cannot be combined with danger_accept_invalid_certs or root_certificates"
+                    .into(),
+            );
         }
         Ok(())
     }

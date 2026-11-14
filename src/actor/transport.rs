@@ -5,11 +5,13 @@
 
 use crate::Error;
 use crate::core::event::Frame;
+use crate::tls::Connector;
 use futures::stream::StreamExt;
 use futures::{Sink, Stream};
 use log::debug;
 use std::pin::Pin;
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -20,7 +22,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig as WsProtocolConfig;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::{Connector, connect_async_tls_with_config};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 /// Boxed message sink of an established connection (owned by the writer task).
 pub(crate) type BoxSink = Pin<Box<dyn Sink<Message, Error = WsError> + Send>>;
@@ -30,8 +32,14 @@ pub(crate) type BoxStream = Pin<Box<dyn Stream<Item = Result<Message, WsError>> 
 pub(crate) type ConnectFuture =
     Pin<Box<dyn Future<Output = Result<(BoxSink, BoxStream), Error>> + Send>>;
 
+/// An established connection with the handshake response.
+type Connection = (
+    WebSocketStream<MaybeTlsStream<TcpStream>>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+);
+
 /// Options for a single connection attempt.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub(crate) struct ConnectOptions {
     /// Timeout for the whole attempt (including redirects).
     pub timeout: Duration,
@@ -39,9 +47,12 @@ pub(crate) struct ConnectOptions {
     pub max_redirects: u8,
     /// WebSocket protocol configuration (frame/message size limits etc.).
     pub ws_config: WsProtocolConfig,
-    /// Accept invalid TLS certificates and hostnames (wss only). See
-    /// [`crate::WebSocketConfig::danger_accept_invalid_certs`].
-    pub danger_accept_invalid_certs: bool,
+    /// TLS connector for `wss://` connections; `None` uses the transport default.
+    #[cfg_attr(
+        not(any(feature = "native-tls", feature = "rustls-platform-verifier")),
+        allow(dead_code)
+    )]
+    pub connector: Option<Connector>,
 }
 
 /// Connects a WebSocket and returns the split transport halves.
@@ -68,22 +79,6 @@ impl Transport for TungsteniteTransport {
     }
 }
 
-/// Builds the TLS connector for a connection attempt.
-///
-/// Returns `None` (tungstenite's default connector: native-tls with system CA roots and
-/// full verification) unless certificate verification is disabled.
-fn build_connector(danger_accept_invalid_certs: bool) -> Result<Option<Connector>, Error> {
-    if !danger_accept_invalid_certs {
-        return Ok(None);
-    }
-    let tls = native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .build()
-        .map_err(|e| Error::WebSocket(format!("Cannot build TLS connector: {e}")))?;
-    Ok(Some(Connector::NativeTls(tls)))
-}
-
 /// Attempts to establish a websocket connection, following HTTP redirects up to
 /// `options.max_redirects`.
 async fn connect_follow_redirects(
@@ -92,15 +87,7 @@ async fn connect_follow_redirects(
 ) -> Result<(BoxSink, BoxStream), Error> {
     let mut max_redirects = options.max_redirects;
     loop {
-        let connector = build_connector(options.danger_accept_invalid_certs)?;
-        match connect_async_tls_with_config(
-            request.clone(),
-            Some(options.ws_config),
-            false,
-            connector,
-        )
-        .await
-        {
+        match connect(request.clone(), &options).await {
             Ok((ws_stream, _resp)) => {
                 let (sink, stream) = ws_stream.split();
                 return Ok((Box::pin(sink), Box::pin(stream)));
@@ -129,12 +116,27 @@ async fn connect_follow_redirects(
                 request = build_redirect_request(&request, location)?;
                 max_redirects -= 1;
             }
-            Err(WsError::Http(resp)) => {
-                return Err(Error::WebSocket(format!("HTTP error: {}", resp.status())));
-            }
             Err(e) => return Err(Error::from(e)),
         }
     }
+}
+
+/// A single connection attempt with the configured TLS connector.
+#[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
+async fn connect(request: WsRequest, options: &ConnectOptions) -> Result<Connection, WsError> {
+    tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        Some(options.ws_config),
+        false,
+        options.connector.clone(),
+    )
+    .await
+}
+
+/// A single connection attempt without a TLS backend: plain `ws://` only.
+#[cfg(not(any(feature = "native-tls", feature = "rustls-platform-verifier")))]
+async fn connect(request: WsRequest, options: &ConnectOptions) -> Result<Connection, WsError> {
+    tokio_tungstenite::connect_async_with_config(request, Some(options.ws_config), false).await
 }
 
 fn is_redirect(status: StatusCode) -> bool {

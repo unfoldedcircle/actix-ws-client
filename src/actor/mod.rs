@@ -18,6 +18,7 @@ use crate::core::{CoreConfig, Machine};
 use crate::error::Error;
 use crate::handler::{HandlerAction, WebSocketMessageHandler};
 use crate::message::{Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
+use crate::tls::{Connector, build_connector};
 use actix::fut::{ActorFutureExt, wrap_future};
 use actix::prelude::*;
 use log::{debug, info, trace, warn};
@@ -93,6 +94,8 @@ where
     pending_connect: Option<oneshot::Sender<Result<(), Error>>>,
     // Optional per-attempt URL refresh hook.
     url_provider: Option<UrlProvider>,
+    // TLS connector of the configuration, built on the first connection attempt.
+    connector: Option<Option<Connector>>,
     // Timestamp of the last traced outbound message (msg_tracing_out).
     last_msg_send_time: Option<Instant>,
 }
@@ -147,6 +150,7 @@ where
             pending_stream: None,
             pending_connect: None,
             url_provider: None,
+            connector: None,
             last_msg_send_time: None,
         })
     }
@@ -279,17 +283,23 @@ where
             ctx.cancel_future(handle);
         }
 
-        // Per-attempt URL refresh hook (e.g. DNS/IP cache of the consumer).
-        if let Err(error) = self.refresh_request() {
-            // Invalid refreshed URL: fail this attempt through the normal path, as
-            // an immediately-failing connect task.
-            let handle = ctx.spawn(wrap_future::<_, Self>(async {}).map(move |_, actor, ctx| {
-                actor.connect_handle = None;
-                actor.dispatch(Event::ConnectFailed { generation, error }, ctx);
-            }));
-            self.connect_handle = Some(handle);
-            return;
-        }
+        // Per-attempt URL refresh hook (e.g. DNS/IP cache of the consumer), then the
+        // TLS connector (built once, on the first attempt).
+        let prepared = self.refresh_request().and_then(|_| self.tls_connector());
+        let connector = match prepared {
+            Ok(connector) => connector,
+            Err(error) => {
+                // Invalid refreshed URL or TLS configuration: fail this attempt through
+                // the normal path, as an immediately-failing connect task.
+                let handle =
+                    ctx.spawn(wrap_future::<_, Self>(async {}).map(move |_, actor, ctx| {
+                        actor.connect_handle = None;
+                        actor.dispatch(Event::ConnectFailed { generation, error }, ctx);
+                    }));
+                self.connect_handle = Some(handle);
+                return;
+            }
+        };
 
         debug!("[{}] Connecting (#{generation})", self.id);
 
@@ -304,7 +314,7 @@ where
             timeout,
             max_redirects: self.config.max_redirects,
             ws_config,
-            danger_accept_invalid_certs: self.config.danger_accept_invalid_certs,
+            connector,
         };
         let future = self.transport.connect(self.request.clone(), options);
         let handle = ctx.spawn(
@@ -326,6 +336,16 @@ where
             }),
         );
         self.connect_handle = Some(handle);
+    }
+
+    /// Returns the TLS connector for the configuration, building it on first use.
+    fn tls_connector(&mut self) -> Result<Option<Connector>, Error> {
+        if let Some(connector) = &self.connector {
+            return Ok(connector.clone());
+        }
+        let connector = build_connector(&self.config)?;
+        self.connector = Some(connector.clone());
+        Ok(connector)
     }
 
     /// Polls the URL provider and swaps the request URL if a new one is supplied.
@@ -1172,6 +1192,7 @@ mod tests {
         assert_eq!(attempts[0].options.ws_config.max_frame_size, Some(65_536));
     }
 
+    #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
     #[actix_rt::test]
     async fn danger_accept_invalid_certs_is_passed_to_the_transport() {
         let (sink, _sent) = mock_sink(usize::MAX);
@@ -1194,7 +1215,8 @@ mod tests {
         addr.send(Connect).await.unwrap().unwrap();
 
         let attempts = attempts.lock().unwrap();
-        assert!(attempts[0].options.danger_accept_invalid_certs);
+        // A dedicated connector without verification replaces the transport default.
+        assert!(attempts[0].options.connector.is_some());
     }
 
     #[actix_rt::test]
@@ -1217,6 +1239,8 @@ mod tests {
             defaults.max_frame_size
         );
         // TLS verification is on by default
-        assert!(!attempts[0].options.danger_accept_invalid_certs);
+        // native-tls: the transport's default connector (system roots, full verification).
+        #[cfg(feature = "native-tls")]
+        assert!(attempts[0].options.connector.is_none());
     }
 }
