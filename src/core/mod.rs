@@ -44,6 +44,8 @@ type JitterSource = Box<dyn FnMut() -> f64 + Send>;
 pub(crate) struct CoreConfig {
     /// Timeout for a single connection attempt.
     pub connect_timeout: Duration,
+    /// Whether keep-alive pings are sent.
+    pub ping_enabled: bool,
     /// Keep-alive ping interval.
     pub ping_interval: Duration,
     /// Consecutive missed pongs before dropping the connection.
@@ -60,6 +62,7 @@ impl From<&crate::WebSocketConfig> for CoreConfig {
     fn from(cfg: &crate::WebSocketConfig) -> Self {
         Self {
             connect_timeout: cfg.connect_timeout,
+            ping_enabled: cfg.ping_enabled,
             ping_interval: cfg.ping_interval,
             max_missed_pongs: cfg.max_missed_pongs,
             min_stable_uptime: cfg.min_stable_uptime,
@@ -223,16 +226,19 @@ impl Machine {
         self.connected_at = Some(now);
         self.keepalive.reset();
         self.signalled_connected = true;
-        vec![
+        let mut effects = vec![
             Effect::StartWriterTask { generation },
             Effect::StartReaderTask { generation },
-            Effect::StartKeepAlive {
+        ];
+        if self.cfg.ping_enabled {
+            effects.push(Effect::StartKeepAlive {
                 generation,
                 interval: self.cfg.ping_interval,
-            },
-            Effect::Emit(Callback::OnConnected),
-            Effect::CompleteConnect { result: Ok(()) },
-        ]
+            });
+        }
+        effects.push(Effect::Emit(Callback::OnConnected));
+        effects.push(Effect::CompleteConnect { result: Ok(()) });
+        effects
     }
 
     fn on_connect_failed(&mut self, generation: u64, error: Error) -> Vec<Effect> {
@@ -251,6 +257,8 @@ impl Machine {
         if self.state != ConnState::Connected || generation != self.generation {
             return Vec::new(); // stale connection
         }
+        // Any received frame proves the peer is alive, not only a pong.
+        self.keepalive.on_activity();
         match frame {
             Frame::Text(text) => vec![Effect::Emit(Callback::OnText(text))],
             Frame::Binary(data) => vec![Effect::Emit(Callback::OnBinary(data))],
@@ -260,10 +268,7 @@ impl Machine {
             Frame::Ping(payload) => vec![Effect::SendFrame {
                 frame: Frame::Pong(payload),
             }],
-            Frame::Pong(_) => {
-                self.keepalive.on_pong();
-                Vec::new()
-            }
+            Frame::Pong(_) => Vec::new(),
             Frame::Close => {
                 // Reply to the peer's close handshake, then tear down.
                 let mut effects = vec![Effect::SendFrame {
@@ -422,6 +427,7 @@ mod tests {
     fn test_config() -> CoreConfig {
         CoreConfig {
             connect_timeout: CONNECT_TIMEOUT,
+            ping_enabled: true,
             ping_interval: PING_INTERVAL,
             max_missed_pongs: 2,
             min_stable_uptime: MIN_STABLE_UPTIME,
@@ -717,6 +723,52 @@ mod tests {
             "keep-alive teardown must not send a Close frame"
         );
         assert_eq!(count_disconnected(&effects), 1);
+    }
+
+    #[test]
+    fn any_received_frame_keeps_the_connection_alive() {
+        let mut m = machine();
+        let now = t0();
+        let generation = connect(&mut m, now);
+
+        // The peer never answers a ping but keeps sending data.
+        for _ in 0..10 {
+            m.on_event(Event::KeepAliveTick { generation }, now);
+            m.on_event(
+                Event::FrameReceived {
+                    generation,
+                    frame: Frame::Text("data".into()),
+                },
+                now,
+            );
+        }
+        assert_eq!(m.state(), ConnState::Connected);
+    }
+
+    #[test]
+    fn disabled_ping_starts_no_keep_alive() {
+        let mut m = Machine::with_jitter(
+            CoreConfig {
+                ping_enabled: false,
+                ..test_config()
+            },
+            Box::new(|| 0.0),
+        );
+        let now = t0();
+        m.on_event(Event::ConnectRequested, now);
+        let generation = m.generation();
+
+        let effects = m.on_event(Event::ConnectSucceeded { generation }, now);
+
+        assert_eq!(
+            effects,
+            vec![
+                Effect::StartWriterTask { generation },
+                Effect::StartReaderTask { generation },
+                Effect::Emit(Callback::OnConnected),
+                Effect::CompleteConnect { result: Ok(()) },
+            ]
+        );
     }
 
     #[test]

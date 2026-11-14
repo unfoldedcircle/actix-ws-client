@@ -16,14 +16,25 @@ use std::time::Duration;
     build_fn(validate = "Self::validate")
 )]
 pub struct WebSocketConfig {
+    /// Whether the client sends WebSocket ping frames to detect a dead connection.
+    ///
+    /// Disable it for servers that require an application-level heartbeat instead:
+    /// the consumer then sends its own heartbeat messages and requests a
+    /// [`crate::HandlerAction::Reconnect`] or sends [`crate::Reconnect`] when the
+    /// server stops answering. Pings of the server are answered in any case.
+    ///
+    /// Default is true.
+    #[builder(default = "true")]
+    pub(crate) ping_enabled: bool,
     /// Interval between pings sent by the client.
     ///
     /// Default is 30 seconds.
     #[builder(default = "Duration::from_secs(30)")]
     pub(crate) ping_interval: Duration,
-    /// Number of consecutive missed pongs before triggering a reconnect.
+    /// Number of consecutive unanswered pings before triggering a reconnect.
     ///
-    /// The keep-alive detection budget is `max_missed_pongs * ping_interval`.
+    /// A ping counts as answered when any frame is received after it, not only its
+    /// pong. The keep-alive detection budget is `max_missed_pongs * ping_interval`.
     ///
     /// Default is 2.
     #[builder(default = "2")]
