@@ -28,10 +28,11 @@ pub(crate) mod keepalive;
 pub(crate) mod state;
 
 use crate::Error;
+use crate::handler::DisconnectReason;
 use backoff::BackoffCfg;
 use bytes::Bytes;
 use effect::{Callback, Effect};
-use event::{Event, Frame};
+use event::{CloseInfo, Event, Frame};
 use keepalive::{KeepAlive, KeepAliveOutcome};
 use state::ConnState;
 use std::time::{Duration, Instant};
@@ -132,7 +133,8 @@ impl Machine {
     pub(crate) fn on_event(&mut self, event: Event, now: Instant) -> Vec<Effect> {
         match event {
             Event::ConnectRequested => self.on_connect_requested(),
-            Event::DisconnectRequested => self.on_disconnect_requested(),
+            Event::DisconnectRequested => self.on_disconnect_requested(None),
+            Event::CloseRequested { close } => self.on_disconnect_requested(Some(close)),
             Event::ReconnectRequested => self.on_reconnect_requested(),
             Event::ConnectSucceeded { generation } => self.on_connect_succeeded(generation, now),
             Event::ConnectFailed { generation, error } => self.on_connect_failed(generation, error),
@@ -166,11 +168,13 @@ impl Machine {
         }
     }
 
-    fn on_disconnect_requested(&mut self) -> Vec<Effect> {
+    /// `close` is the status code and reason for the close frame; `None` sends a
+    /// normal closure.
+    fn on_disconnect_requested(&mut self, close: Option<CloseInfo>) -> Vec<Effect> {
         self.should_reconnect = false;
         match self.state {
             ConnState::Connected => {
-                let effects = self.close_connected();
+                let effects = self.close_connected(close);
                 self.state = ConnState::Disconnected;
                 effects
             }
@@ -201,7 +205,7 @@ impl Machine {
             ConnState::Connected => {
                 // Graceful close of the current connection, then immediately start a
                 // fresh one with a reset attempt counter.
-                let mut effects = self.close_connected();
+                let mut effects = self.close_connected(None);
                 self.should_reconnect = true;
                 self.reconnection_attempts = 0;
                 effects.extend(self.start_connect());
@@ -269,12 +273,18 @@ impl Machine {
                 frame: Frame::Pong(payload),
             }],
             Frame::Pong(_) => Vec::new(),
-            Frame::Close => {
+            Frame::Close(close) => {
                 // Reply to the peer's close handshake, then tear down.
                 let mut effects = vec![Effect::SendFrame {
-                    frame: Frame::Close,
+                    frame: Frame::Close(None),
                 }];
-                effects.extend(self.leave_connected(now));
+                let (code, reason) = match close {
+                    Some(close) => (Some(close.code), close.reason),
+                    None => (None, String::new()),
+                };
+                effects.extend(
+                    self.leave_connected(now, DisconnectReason::ClosedByServer { code, reason }),
+                );
                 self.schedule_reconnect_or_idle(&mut effects);
                 effects
             }
@@ -291,10 +301,14 @@ impl Machine {
             return Vec::new(); // stale connection
         }
         let mut effects = Vec::new();
-        if let Some(error) = error {
-            effects.push(Effect::Emit(Callback::OnError(error)));
-        }
-        effects.extend(self.leave_connected(now));
+        let reason = match error {
+            Some(error) => {
+                effects.push(Effect::Emit(Callback::OnError(error.clone())));
+                DisconnectReason::Error(error)
+            }
+            None => DisconnectReason::StreamEnded,
+        };
+        effects.extend(self.leave_connected(now, reason));
         self.schedule_reconnect_or_idle(&mut effects);
         effects
     }
@@ -310,7 +324,7 @@ impl Machine {
             KeepAliveOutcome::Reconnect => {
                 // RFC 6455 §7.1.7 "Fail the WebSocket Connection": the peer is
                 // unresponsive, so drop the connection without a Close handshake.
-                let mut effects = self.leave_connected(now);
+                let mut effects = self.leave_connected(now, DisconnectReason::KeepAliveTimeout);
                 self.schedule_reconnect_or_idle(&mut effects);
                 effects
             }
@@ -333,17 +347,17 @@ impl Machine {
     /// terminating, so the Close frame is still sent).
     ///
     /// The caller decides the next state.
-    fn close_connected(&mut self) -> Vec<Effect> {
+    fn close_connected(&mut self, close: Option<CloseInfo>) -> Vec<Effect> {
         let mut effects = vec![
             Effect::StopKeepAlive,
             Effect::SendFrame {
-                frame: Frame::Close,
+                frame: Frame::Close(close),
             },
             Effect::TearDownConnection {
                 generation: self.generation,
             },
         ];
-        effects.extend(self.emit_disconnected_edge());
+        effects.extend(self.emit_disconnected_edge(DisconnectReason::ClosedLocally));
         self.connected_at = None;
         self.keepalive.reset();
         effects
@@ -362,7 +376,7 @@ impl Machine {
     /// Common teardown when leaving `Connected`: resets the backoff counter if the
     /// connection was stable long enough (flapping protection), stops keep-alive,
     /// tears down connection resources and emits a balanced `OnDisconnected`.
-    fn leave_connected(&mut self, now: Instant) -> Vec<Effect> {
+    fn leave_connected(&mut self, now: Instant, reason: DisconnectReason) -> Vec<Effect> {
         if let Some(connected_at) = self.connected_at
             && now.duration_since(connected_at) >= self.cfg.min_stable_uptime
         {
@@ -376,17 +390,20 @@ impl Machine {
                 generation: self.generation,
             },
         ];
-        effects.extend(self.emit_disconnected_edge());
+        effects.extend(self.emit_disconnected_edge(reason));
         effects
     }
 
-    /// Emits `OnDisconnected` only on an actual `Connected →` leaving edge.
-    fn emit_disconnected_edge(&mut self) -> Option<Effect> {
+    /// Emits `OnClosed` + `OnDisconnected` only on an actual `Connected →` leaving edge.
+    fn emit_disconnected_edge(&mut self, reason: DisconnectReason) -> Vec<Effect> {
         if self.signalled_connected {
             self.signalled_connected = false;
-            Some(Effect::Emit(Callback::OnDisconnected))
+            vec![
+                Effect::Emit(Callback::OnClosed(reason)),
+                Effect::Emit(Callback::OnDisconnected),
+            ]
         } else {
-            None
+            Vec::new()
         }
     }
 
@@ -717,7 +734,7 @@ mod tests {
             !effects.iter().any(|e| matches!(
                 e,
                 Effect::SendFrame {
-                    frame: Frame::Close
+                    frame: Frame::Close(None)
                 }
             )),
             "keep-alive teardown must not send a Close frame"
@@ -945,7 +962,7 @@ mod tests {
         let effects = m.on_event(
             Event::FrameReceived {
                 generation,
-                frame: Frame::Close,
+                frame: Frame::Close(None),
             },
             now,
         );
@@ -1047,7 +1064,7 @@ mod tests {
         let effects = m.on_event(
             Event::FrameReceived {
                 generation,
-                frame: Frame::Close,
+                frame: Frame::Close(None),
             },
             now,
         );
@@ -1055,7 +1072,7 @@ mod tests {
         assert_eq!(
             effects[0],
             Effect::SendFrame {
-                frame: Frame::Close
+                frame: Frame::Close(None)
             }
         );
         assert!(effects.contains(&Effect::TearDownConnection { generation }));
@@ -1083,6 +1100,183 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Disconnect reason and close status code
+    // ------------------------------------------------------------------
+
+    /// The reason reported for the end of the connection, and that it is directly
+    /// followed by the balanced `OnDisconnected`.
+    fn closed_reason(effects: &[Effect]) -> DisconnectReason {
+        let pos = effects
+            .iter()
+            .position(|e| matches!(e, Effect::Emit(Callback::OnClosed(_))))
+            .expect("OnClosed emitted");
+        assert_eq!(effects[pos + 1], Effect::Emit(Callback::OnDisconnected));
+        match &effects[pos] {
+            Effect::Emit(Callback::OnClosed(reason)) => reason.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn server_close_reports_code_and_reason() {
+        let mut m = machine();
+        let now = t0();
+        let generation = connect(&mut m, now);
+
+        let effects = m.on_event(
+            Event::FrameReceived {
+                generation,
+                frame: Frame::Close(Some(CloseInfo {
+                    code: 4001,
+                    reason: "session expired".into(),
+                })),
+            },
+            now,
+        );
+
+        assert_eq!(
+            closed_reason(&effects),
+            DisconnectReason::ClosedByServer {
+                code: Some(4001),
+                reason: "session expired".into()
+            }
+        );
+    }
+
+    #[test]
+    fn server_close_without_status_reports_no_code() {
+        let mut m = machine();
+        let now = t0();
+        let generation = connect(&mut m, now);
+
+        let effects = m.on_event(
+            Event::FrameReceived {
+                generation,
+                frame: Frame::Close(None),
+            },
+            now,
+        );
+
+        assert_eq!(
+            closed_reason(&effects),
+            DisconnectReason::ClosedByServer {
+                code: None,
+                reason: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn local_disconnect_and_reconnect_report_closed_locally() {
+        let mut m = machine();
+        let now = t0();
+        connect(&mut m, now);
+        let effects = m.on_event(Event::DisconnectRequested, now);
+        assert_eq!(closed_reason(&effects), DisconnectReason::ClosedLocally);
+
+        connect(&mut m, now);
+        let effects = m.on_event(Event::ReconnectRequested, now);
+        assert_eq!(closed_reason(&effects), DisconnectReason::ClosedLocally);
+    }
+
+    #[test]
+    fn keep_alive_timeout_is_reported_as_reason() {
+        let mut m = machine();
+        let now = t0();
+        let generation = connect(&mut m, now);
+
+        m.on_event(Event::KeepAliveTick { generation }, now);
+        m.on_event(Event::KeepAliveTick { generation }, now);
+        let effects = m.on_event(Event::KeepAliveTick { generation }, now);
+
+        assert_eq!(closed_reason(&effects), DisconnectReason::KeepAliveTimeout);
+    }
+
+    #[test]
+    fn lost_connection_reports_error_or_stream_end() {
+        let mut m = machine();
+        let now = t0();
+        let generation = connect(&mut m, now);
+        let error = Error::SendFailed("io".into());
+        let effects = m.on_event(
+            Event::WriteFailed {
+                generation,
+                error: error.clone(),
+            },
+            now,
+        );
+        assert_eq!(closed_reason(&effects), DisconnectReason::Error(error));
+
+        let mut m = machine();
+        let generation = connect(&mut m, now);
+        let effects = m.on_event(
+            Event::StreamEnded {
+                generation,
+                error: None,
+            },
+            now,
+        );
+        assert_eq!(closed_reason(&effects), DisconnectReason::StreamEnded);
+    }
+
+    #[test]
+    fn close_request_sends_its_code_and_stops_reconnecting() {
+        let mut m = machine();
+        let now = t0();
+        connect(&mut m, now);
+        let close = CloseInfo {
+            code: 1008,
+            reason: "unsupported message".into(),
+        };
+
+        let effects = m.on_event(
+            Event::CloseRequested {
+                close: close.clone(),
+            },
+            now,
+        );
+
+        assert!(effects.contains(&Effect::SendFrame {
+            frame: Frame::Close(Some(close))
+        }));
+        assert_eq!(closed_reason(&effects), DisconnectReason::ClosedLocally);
+        assert_eq!(m.state(), ConnState::Disconnected);
+        assert_eq!(reconnect_delay(&effects), None);
+    }
+
+    #[test]
+    fn close_request_while_waiting_to_reconnect_cancels_without_a_frame() {
+        let mut m = machine();
+        let now = t0();
+        let generation = connect(&mut m, now);
+        m.on_event(
+            Event::StreamEnded {
+                generation,
+                error: None,
+            },
+            now,
+        );
+        assert_eq!(m.state(), ConnState::WaitingToReconnect);
+
+        let effects = m.on_event(
+            Event::CloseRequested {
+                close: CloseInfo {
+                    code: 1000,
+                    reason: String::new(),
+                },
+            },
+            now,
+        );
+
+        assert_eq!(m.state(), ConnState::Disconnected);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendFrame { .. }))
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Graceful disconnect
     // ------------------------------------------------------------------
 
@@ -1099,7 +1293,7 @@ mod tests {
                 matches!(
                     e,
                     Effect::SendFrame {
-                        frame: Frame::Close
+                        frame: Frame::Close(None)
                     }
                 )
             })
@@ -1314,7 +1508,7 @@ mod tests {
                 matches!(
                     e,
                     Effect::SendFrame {
-                        frame: Frame::Close
+                        frame: Frame::Close(None)
                     }
                 )
             })

@@ -4,7 +4,7 @@
 //! implementation to drive the client deterministically without TCP.
 
 use crate::Error;
-use crate::core::event::Frame;
+use crate::core::event::{CloseInfo, Frame};
 use crate::tls::TlsContext;
 use futures::stream::StreamExt;
 use futures::{Sink, Stream};
@@ -234,9 +234,29 @@ pub(crate) fn frame_from_message(msg: Message) -> Option<Frame> {
         Message::Binary(data) => Some(Frame::Binary(data)),
         Message::Ping(payload) => Some(Frame::Ping(payload)),
         Message::Pong(payload) => Some(Frame::Pong(payload)),
-        Message::Close(_) => Some(Frame::Close),
+        Message::Close(close) => Some(Frame::Close(close.map(|close| CloseInfo {
+            code: close.code.into(),
+            reason: close.reason.as_str().to_owned(),
+        }))),
         Message::Frame(_) => None,
     }
+}
+
+/// Validates the status code and reason of a close frame to send (RFC 6455 §7.4, §5.5).
+pub(crate) fn validate_close(code: u16, reason: &str) -> Result<(), Error> {
+    if !CloseCode::from(code).is_allowed() {
+        return Err(Error::InvalidRequest(format!(
+            "close code {code} must not be sent in a close frame"
+        )));
+    }
+    // A control frame carries at most 125 bytes: 2 bytes status code + reason.
+    if reason.len() > 123 {
+        return Err(Error::InvalidRequest(format!(
+            "close reason too long: {} bytes (max 123)",
+            reason.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Converts a core [`Frame`] into a tungstenite message for sending.
@@ -246,9 +266,13 @@ pub(crate) fn message_from_frame(frame: Frame) -> Message {
         Frame::Binary(data) => Message::Binary(data),
         Frame::Ping(payload) => Message::Ping(payload),
         Frame::Pong(payload) => Message::Pong(payload),
-        Frame::Close => Message::Close(Some(CloseFrame {
+        Frame::Close(None) => Message::Close(Some(CloseFrame {
             code: CloseCode::Normal,
             reason: Utf8Bytes::from(String::new()),
+        })),
+        Frame::Close(Some(close)) => Message::Close(Some(CloseFrame {
+            code: CloseCode::from(close.code),
+            reason: Utf8Bytes::from(close.reason),
         })),
     }
 }
@@ -339,8 +363,11 @@ mod tests {
             Some(Frame::Binary(data))
         );
         assert_eq!(
-            frame_from_message(message_from_frame(Frame::Close)),
-            Some(Frame::Close)
+            frame_from_message(message_from_frame(Frame::Close(None))),
+            Some(Frame::Close(Some(CloseInfo {
+                code: 1000,
+                reason: String::new()
+            })))
         );
     }
 }

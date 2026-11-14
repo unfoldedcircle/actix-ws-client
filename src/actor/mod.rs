@@ -13,11 +13,11 @@ pub(crate) mod writer;
 
 use crate::config::WebSocketConfig;
 use crate::core::effect::{Callback, Effect};
-use crate::core::event::{Event, Frame};
+use crate::core::event::{CloseInfo, Event, Frame};
 use crate::core::{CoreConfig, Machine};
 use crate::error::Error;
 use crate::handler::{HandlerAction, TraceDirection, WebSocketMessageHandler};
-use crate::message::{Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
+use crate::message::{Close, Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
 use crate::tls::TlsContext;
 use actix::fut::{ActorFutureExt, wrap_future};
 use actix::prelude::*;
@@ -33,6 +33,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig as WsProtocolConfig;
 use transport::{
     BoxSink, BoxStream, ConnectOptions, Transport, TungsteniteTransport, message_from_frame,
+    validate_close,
 };
 use writer::WriteItem;
 
@@ -240,6 +241,18 @@ where
             HandlerAction::SendBinary(data) => self.send_handler_frame(Message::Binary(data)),
             HandlerAction::Disconnect => {
                 self.dispatch(Event::DisconnectRequested, ctx);
+            }
+            HandlerAction::Close { code, reason } => {
+                let event = match validate_close(code, &reason) {
+                    Ok(()) => Event::CloseRequested {
+                        close: CloseInfo { code, reason },
+                    },
+                    Err(error) => {
+                        warn!("[{}] {error}: closing with a normal closure", self.id);
+                        Event::DisconnectRequested
+                    }
+                };
+                self.dispatch(event, ctx);
             }
             HandlerAction::Reconnect => {
                 self.dispatch(Event::ReconnectRequested, ctx);
@@ -489,6 +502,11 @@ where
                 info!("[{}] Connected", self.id);
                 self.handler.on_connected()
             }
+            Callback::OnClosed(reason) => {
+                debug!("[{}] Connection closed: {reason:?}", self.id);
+                self.handler.on_closed(&reason);
+                Vec::new()
+            }
             Callback::OnDisconnected => {
                 info!("[{}] Disconnected", self.id);
                 self.handler.on_disconnected();
@@ -595,6 +613,28 @@ impl<H: WebSocketMessageHandler> Handler<Disconnect> for GenericWebSocketClient<
     }
 }
 
+impl<H: WebSocketMessageHandler> Handler<Close> for GenericWebSocketClient<H> {
+    type Result = Result<(), Error>;
+
+    fn handle(&mut self, msg: Close, ctx: &mut Context<Self>) -> Self::Result {
+        validate_close(msg.code, &msg.reason)?;
+        debug!(
+            "[{}] Explicit disconnect requested (close code {})",
+            self.id, msg.code
+        );
+        self.dispatch(
+            Event::CloseRequested {
+                close: CloseInfo {
+                    code: msg.code,
+                    reason: msg.reason,
+                },
+            },
+            ctx,
+        );
+        Ok(())
+    }
+}
+
 impl<H: WebSocketMessageHandler> Handler<Reconnect> for GenericWebSocketClient<H> {
     type Result = ();
 
@@ -660,9 +700,11 @@ impl<H: WebSocketMessageHandler> Handler<WriteFailedMsg> for GenericWebSocketCli
 mod tests {
     use super::testutil::{MockTransport, blocked_sink, mock_sink, scripted_stream};
     use super::*;
-    use crate::WebSocketConfig;
+    use crate::{DisconnectReason, WebSocketConfig};
     use bytes::Bytes;
     use std::sync::Mutex;
+    use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
     #[derive(Clone, Default)]
     struct TestHandler {
@@ -711,6 +753,9 @@ mod tests {
         fn on_connected(&mut self) -> Vec<HandlerAction> {
             self.log.lock().unwrap().push("connected".into());
             std::mem::take(&mut *self.connected_actions.lock().unwrap())
+        }
+        fn on_closed(&mut self, reason: &DisconnectReason) {
+            self.log.lock().unwrap().push(format!("closed:{reason:?}"));
         }
         fn on_disconnected(&mut self) {
             self.log.lock().unwrap().push("disconnected".into());
@@ -991,6 +1036,136 @@ mod tests {
         .await;
         assert!(!addr.send(IsConnected).await.unwrap());
         assert_eq!(handler.count("disconnected"), 1);
+    }
+
+    fn sent_close(sent: &Arc<Mutex<Vec<Message>>>, code: u16, reason: &str) -> bool {
+        sent_contains(sent, |m| {
+            matches!(m, Message::Close(Some(close))
+                if u16::from(close.code) == code && close.reason.as_str() == reason)
+        })
+    }
+
+    #[actix_rt::test]
+    async fn close_message_sends_code_and_reason_without_reconnect() {
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, attempts) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        addr.send(Close::new(4000, "going to standby"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        wait_until(
+            || sent_close(&sent, 4000, "going to standby"),
+            "close frame written",
+        )
+        .await;
+        assert!(handler.log_contains("closed:ClosedLocally"));
+        assert_eq!(handler.count("disconnected"), 1);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+    }
+
+    #[actix_rt::test]
+    async fn close_message_rejects_invalid_code_and_long_reason() {
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let addr = client(transport, TestHandler::default());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        // 1006 (abnormal closure) must never be sent in a close frame
+        let result = addr.send(Close::new(1006, "")).await.unwrap();
+        assert!(matches!(result, Err(Error::InvalidRequest(_))));
+        let result = addr.send(Close::new(1000, "x".repeat(124))).await.unwrap();
+        assert!(matches!(result, Err(Error::InvalidRequest(_))));
+
+        // the connection is left untouched
+        assert!(addr.send(IsConnected).await.unwrap());
+        assert!(!sent_contains(&sent, |m| matches!(m, Message::Close(_))));
+    }
+
+    #[actix_rt::test]
+    async fn close_action_sends_code_and_reason() {
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        handler.set_text_actions(vec![HandlerAction::Close {
+            code: 1003,
+            reason: "binary not supported".into(),
+        }]);
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        script
+            .unbounded_send(Ok(Message::Text("trigger".into())))
+            .unwrap();
+
+        wait_until(
+            || sent_close(&sent, 1003, "binary not supported"),
+            "close frame written",
+        )
+        .await;
+        assert!(!addr.send(IsConnected).await.unwrap());
+    }
+
+    #[actix_rt::test]
+    async fn invalid_close_action_falls_back_to_a_normal_closure() {
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        handler.set_text_actions(vec![HandlerAction::Close {
+            code: 1005,
+            reason: String::new(),
+        }]);
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        script
+            .unbounded_send(Ok(Message::Text("trigger".into())))
+            .unwrap();
+
+        wait_until(|| sent_close(&sent, 1000, ""), "close frame written").await;
+        assert!(!addr.send(IsConnected).await.unwrap());
+    }
+
+    #[actix_rt::test]
+    async fn server_close_code_is_reported_before_disconnected() {
+        let (sink, _sent) = mock_sink(usize::MAX);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        script
+            .unbounded_send(Ok(Message::Close(Some(CloseFrame {
+                code: CloseCode::from(4001),
+                reason: "session expired".into(),
+            }))))
+            .unwrap();
+
+        wait_until(|| handler.count("disconnected") == 1, "disconnected").await;
+        let log = handler.log.lock().unwrap();
+        let closed = log
+            .iter()
+            .position(|e| {
+                e == &format!(
+                    "closed:{:?}",
+                    DisconnectReason::ClosedByServer {
+                        code: Some(4001),
+                        reason: "session expired".into()
+                    }
+                )
+            })
+            .expect("close reason reported");
+        assert_eq!(log[closed + 1], "disconnected");
     }
 
     #[actix_rt::test]

@@ -47,14 +47,15 @@ TLS options of `WebSocketConfig`, working with both backends:
 
 - `GenericWebSocketClient::<H>::new(id, request, config, handler)` — construct the
   actor; optionally chain `.with_url_provider(...)`; start it with `.start()`.
-- Messages: `Connect`, `Disconnect` (close, stop reconnecting), `Reconnect` (close,
+- Messages: `Connect`, `Disconnect` (close, stop reconnecting), `Close` (like
+  `Disconnect`, with a close status code and reason), `Reconnect` (close,
   reconnect per policy with a fresh attempt counter), `SendText`, `SendBinary`,
   `IsConnected`.
 - `WebSocketMessageHandler` — callback trait (`on_text`, `on_binary`, `on_connected`,
-  `on_disconnected`, `on_error`, `on_reconnect_exhausted`, `redact_trace`). `on_text` / `on_binary` /
+  `on_closed`, `on_disconnected`, `on_error`, `on_reconnect_exhausted`, `redact_trace`). `on_text` / `on_binary` /
   `on_connected` return a `Vec<HandlerAction>` executed by the client right after the
-  callback: `SendText`, `SendBinary`, `Disconnect` (terminal) or `Reconnect` (fresh
-  connection). This lets a handler implement request/reply protocols (e.g. an
+  callback: `SendText`, `SendBinary`, `Disconnect` / `Close { code, reason }`
+  (terminal) or `Reconnect` (fresh connection). This lets a handler implement request/reply protocols (e.g. an
   authentication handshake) or disconnect on fatal messages without holding a client
   address — the handler stays a pure, unit-testable function of its input. Send
   actions returned while the connection is no longer up are dropped with a warning.
@@ -189,6 +190,32 @@ fires exactly once per established connection, `on_disconnected` exactly once wh
 that connection ends — never duplicated, never unpaired (P2-3). A failed connect
 attempt emits `on_error`, not `on_disconnected`. `SendText` / `SendBinary` while not
 connected fail immediately with `Error::NotConnected`.
+
+## Close status code and reason
+
+**Sending.** `Disconnect` closes with status 1000 (normal closure) and no reason. The
+`Close::new(code, reason)` message and `HandlerAction::Close { code, reason }` close
+with a specific status, e.g. 1003 (unsupported data), 1008 (policy violation) or an
+application code 4000–4999. Both stop reconnecting, like `Disconnect`. A status that
+must not be sent (RFC 6455 §7.4, e.g. 1005, 1006) or a reason longer than 123 bytes is
+rejected: the message returns `Error::InvalidRequest` and leaves the connection
+untouched; the handler action logs a warning and closes with 1000.
+
+**Receiving.** `on_closed(&DisconnectReason)` is called once per ended connection,
+directly before `on_disconnected`:
+
+| `DisconnectReason`                | Cause                                                    |
+|-----------------------------------|----------------------------------------------------------|
+| `ClosedByServer { code, reason }` | Close frame of the server (`code` is `None` without a status) |
+| `ClosedLocally`                   | `Disconnect` / `Close` / `Reconnect`, or the actor stopped |
+| `KeepAliveTimeout`                | The server stopped answering pings                       |
+| `Error(error)`                    | Read or write failure                                    |
+| `StreamEnded`                     | Connection ended without a close frame and without an error |
+
+The reconnect policy does not depend on the reason: after a server close the client
+reconnects as before. A consumer that must not reconnect after a specific status
+(e.g. an application code for "access revoked") sends `Disconnect` from its
+`on_closed` handling.
 
 ## Configuration
 

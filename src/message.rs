@@ -53,6 +53,34 @@ impl SendBinary {
 #[rtype(result = "()")]
 pub struct Disconnect;
 
+/// Message sent to the [`crate::GenericWebSocketClient`] to trigger a graceful disconnect
+/// with a specific close status code and reason.
+///
+/// Same semantics as [`Disconnect`], which closes with status 1000 (normal closure)
+/// and no reason. Without an established connection no close frame is sent.
+///
+/// Fails with [`Error::InvalidRequest`], without closing, if the status code may not
+/// be sent in a close frame (RFC 6455 §7.4: allowed are 1000–1003, 1007–1014 and
+/// 3000–4999) or the reason is longer than 123 bytes.
+#[derive(Message, Clone, Debug)]
+#[rtype(result = "Result<(), Error>")]
+pub struct Close {
+    /// The close status code.
+    pub code: u16,
+    /// The close reason; may be empty.
+    pub reason: String,
+}
+
+impl Close {
+    /// Creates a new close message.
+    pub fn new(code: u16, reason: impl Into<String>) -> Self {
+        Self {
+            code,
+            reason: reason.into(),
+        }
+    }
+}
+
 /// Message sent to the [`crate::GenericWebSocketClient`] to gracefully close the
 /// current connection (if any) and establish a new one.
 ///

@@ -81,8 +81,8 @@ mod tls;
 pub use actor::GenericWebSocketClient;
 pub use config::{WebSocketConfig, WebSocketConfigBuilder, WebSocketConfigBuilderError};
 pub use error::Error;
-pub use handler::{HandlerAction, TraceDirection, WebSocketMessageHandler};
-pub use message::{Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
+pub use handler::{DisconnectReason, HandlerAction, TraceDirection, WebSocketMessageHandler};
+pub use message::{Close, Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
 pub use tls::Certificate;
 #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
 pub use tls::TlsConnector;

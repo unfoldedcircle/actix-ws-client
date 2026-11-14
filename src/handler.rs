@@ -13,6 +13,31 @@ pub enum TraceDirection {
     Outgoing,
 }
 
+/// Why an established connection ended, see [`WebSocketMessageHandler::on_closed`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DisconnectReason {
+    /// The server closed the connection with a close frame.
+    ClosedByServer {
+        /// The close status code (RFC 6455 §7.4), e.g. 1000 (normal), 1001 (going
+        /// away), 1008 (policy violation) or an application code 4000–4999. `None`
+        /// if the close frame carried no status.
+        code: Option<u16>,
+        /// The close reason; empty if the server gave none.
+        reason: String,
+    },
+    /// The client closed the connection: [`crate::Disconnect`], [`crate::Close`] or
+    /// [`crate::Reconnect`] message, the corresponding [`HandlerAction`], or the
+    /// actor stopped.
+    ClosedLocally,
+    /// The server stopped answering keep-alive pings.
+    KeepAliveTimeout,
+    /// Reading from or writing to the socket failed.
+    Error(Error),
+    /// The connection ended without a close frame and without an error.
+    StreamEnded,
+}
+
 /// An action returned from a handler callback, executed by the client actor right
 /// after the callback returns (same invocation — effectively synchronous).
 ///
@@ -29,6 +54,16 @@ pub enum HandlerAction {
     /// [`crate::Disconnect`] message. Use for fatal conditions (e.g. authentication
     /// failure) where retrying would be pointless.
     Disconnect,
+    /// Like [`HandlerAction::Disconnect`], with a specific close status code and
+    /// reason in the close frame — same semantics as the [`crate::Close`] message.
+    /// An invalid code or a too long reason is logged and replaced by a normal
+    /// close (1000).
+    Close {
+        /// The close status code, see [`crate::Close`].
+        code: u16,
+        /// The close reason, see [`crate::Close`].
+        reason: String,
+    },
     /// Gracefully close the connection and reconnect according to the reconnect
     /// policy — same semantics as the [`crate::Reconnect`] message. Use to recover
     /// from a broken session with a fresh connection.
@@ -66,6 +101,14 @@ pub trait WebSocketMessageHandler: Send + Unpin + 'static {
     fn on_connected(&mut self) -> Vec<HandlerAction> {
         Vec::new()
     }
+    /// Called when an established connection ended, with the cause, directly before
+    /// [`WebSocketMessageHandler::on_disconnected`].
+    ///
+    /// Use it to react to the server's close status code, e.g. to stop reconnecting
+    /// with a [`crate::Disconnect`] message after an application-specific code.
+    #[allow(unused_variables)]
+    fn on_closed(&mut self, reason: &DisconnectReason) {}
+
     /// Called when the connection is lost or closed.
     fn on_disconnected(&mut self) {}
     /// Called when an error occurs.
