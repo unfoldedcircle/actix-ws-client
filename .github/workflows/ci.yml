@@ -11,8 +11,8 @@ env:
   TOOLCHAIN_VERSION: "1.89.0"
 
 jobs:
-  test:
-    name: fmt, clippy, test
+  fmt:
+    name: fmt
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -20,14 +20,38 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install "$TOOLCHAIN_VERSION" --profile minimal --component rustfmt,clippy
+          rustup toolchain install "$TOOLCHAIN_VERSION" --profile minimal --component rustfmt
           rustup default "$TOOLCHAIN_VERSION"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  test:
+    name: clippy, test (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: native-tls
+            flags: ""
+          - name: rustls-platform-verifier
+            flags: "--no-default-features --features rustls-platform-verifier"
+          - name: both TLS backends
+            flags: "--features rustls-platform-verifier"
+          - name: no TLS
+            flags: "--no-default-features"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "$TOOLCHAIN_VERSION" --profile minimal --component clippy
+          rustup default "$TOOLCHAIN_VERSION"
+
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy ${{ matrix.flags }} -- -D warnings
 
       - name: Run tests
-        run: cargo test
+        run: cargo test ${{ matrix.flags }}

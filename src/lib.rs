@@ -14,6 +14,13 @@
 //! Actix adapter (`actor`) executes the machine's effects and feeds real-world
 //! happenings back as events. See `README.md` for the full design description.
 //!
+//! ## TLS
+//!
+//! The TLS backend for `wss://` connections is selected with cargo features:
+//! `native-tls` (default) or `rustls-platform-verifier`. With rustls the application
+//! must install a `CryptoProvider`. See `README.md` for the details and the TLS
+//! options of [`WebSocketConfig`].
+//!
 //! ## Callback contract
 //!
 //! [`WebSocketMessageHandler::on_connected`] and
