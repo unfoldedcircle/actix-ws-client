@@ -51,7 +51,7 @@ jobs:
           rustup default "$TOOLCHAIN_VERSION"
 
       - name: Run clippy
-        run: cargo clippy ${{ matrix.flags }} -- -D warnings
+        run: cargo clippy --all-targets ${{ matrix.flags }} -- -D warnings
 
       - name: Run tests
         run: cargo test ${{ matrix.flags }}

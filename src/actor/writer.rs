@@ -105,10 +105,12 @@ mod tests {
         assert_eq!(run_writer(sink, rx, queue.clone()).await, None);
         assert_eq!(queue.load(Ordering::Relaxed), 0);
 
-        let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 100);
-        for (i, msg) in sent.iter().enumerate() {
-            assert_eq!(*msg, text(&format!("message {i}")));
+        {
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent.len(), 100);
+            for (i, msg) in sent.iter().enumerate() {
+                assert_eq!(*msg, text(&format!("message {i}")));
+            }
         }
         for done in completions {
             assert_eq!(done.await.unwrap(), Ok(()));
