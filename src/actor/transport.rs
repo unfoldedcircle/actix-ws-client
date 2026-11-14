@@ -5,7 +5,7 @@
 
 use crate::Error;
 use crate::core::event::Frame;
-use crate::tls::Connector;
+use crate::tls::TlsContext;
 use futures::stream::StreamExt;
 use futures::{Sink, Stream};
 use log::debug;
@@ -47,12 +47,12 @@ pub(crate) struct ConnectOptions {
     pub max_redirects: u8,
     /// WebSocket protocol configuration (frame/message size limits etc.).
     pub ws_config: WsProtocolConfig,
-    /// TLS connector for `wss://` connections; `None` uses the transport default.
+    /// TLS settings for `wss://` targets.
     #[cfg_attr(
         not(any(feature = "native-tls", feature = "rustls-platform-verifier")),
         allow(dead_code)
     )]
-    pub connector: Option<Connector>,
+    pub tls: TlsContext,
 }
 
 /// Connects a WebSocket and returns the split transport halves.
@@ -87,12 +87,13 @@ async fn connect_follow_redirects(
 ) -> Result<(BoxSink, BoxStream), Error> {
     let mut max_redirects = options.max_redirects;
     loop {
-        match connect(request.clone(), &options).await {
-            Ok((ws_stream, _resp)) => {
+        match connect(request.clone(), &options).await? {
+            Attempt::Connected(connection) => {
+                let (ws_stream, _resp) = *connection;
                 let (sink, stream) = ws_stream.split();
                 return Ok((Box::pin(sink), Box::pin(stream)));
             }
-            Err(WsError::Http(resp)) if is_redirect(resp.status()) => {
+            Attempt::Failed(WsError::Http(resp)) if is_redirect(resp.status()) => {
                 if max_redirects == 0 {
                     return Err(Error::WebSocket(format!(
                         "Too many redirects (stopped at {})",
@@ -116,27 +117,49 @@ async fn connect_follow_redirects(
                 request = build_redirect_request(&request, location)?;
                 max_redirects -= 1;
             }
-            Err(e) => return Err(Error::from(e)),
+            Attempt::Failed(e) => return Err(Error::from(e)),
         }
     }
 }
 
-/// A single connection attempt with the configured TLS connector.
+/// Result of a single connection attempt.
+enum Attempt {
+    Connected(Box<Connection>),
+    /// The transport failed; a redirect response is handled by the caller.
+    Failed(WsError),
+}
+
+/// A single connection attempt. The TLS connector is only set up for a `wss://`
+/// target, so plain `ws://` connections never depend on the TLS configuration.
 #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
-async fn connect(request: WsRequest, options: &ConnectOptions) -> Result<Connection, WsError> {
-    tokio_tungstenite::connect_async_tls_with_config(
+async fn connect(request: WsRequest, options: &ConnectOptions) -> Result<Attempt, Error> {
+    let connector = if request.uri().scheme_str() == Some("wss") {
+        options.tls.connector()?
+    } else {
+        None
+    };
+    let result = tokio_tungstenite::connect_async_tls_with_config(
         request,
         Some(options.ws_config),
         false,
-        options.connector.clone(),
+        connector,
     )
-    .await
+    .await;
+    Ok(match result {
+        Ok(connection) => Attempt::Connected(Box::new(connection)),
+        Err(e) => Attempt::Failed(e),
+    })
 }
 
 /// A single connection attempt without a TLS backend: plain `ws://` only.
 #[cfg(not(any(feature = "native-tls", feature = "rustls-platform-verifier")))]
-async fn connect(request: WsRequest, options: &ConnectOptions) -> Result<Connection, WsError> {
-    tokio_tungstenite::connect_async_with_config(request, Some(options.ws_config), false).await
+async fn connect(request: WsRequest, options: &ConnectOptions) -> Result<Attempt, Error> {
+    let result =
+        tokio_tungstenite::connect_async_with_config(request, Some(options.ws_config), false).await;
+    Ok(match result {
+        Ok(connection) => Attempt::Connected(Box::new(connection)),
+        Err(e) => Attempt::Failed(e),
+    })
 }
 
 fn is_redirect(status: StatusCode) -> bool {

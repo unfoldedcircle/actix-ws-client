@@ -18,7 +18,7 @@ use crate::core::{CoreConfig, Machine};
 use crate::error::Error;
 use crate::handler::{HandlerAction, TraceDirection, WebSocketMessageHandler};
 use crate::message::{Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
-use crate::tls::{Connector, build_connector};
+use crate::tls::TlsContext;
 use actix::fut::{ActorFutureExt, wrap_future};
 use actix::prelude::*;
 use log::{debug, info, trace, warn};
@@ -98,8 +98,8 @@ where
     pending_connect: Option<oneshot::Sender<Result<(), Error>>>,
     // Optional per-attempt URL refresh hook.
     url_provider: Option<UrlProvider>,
-    // TLS connector of the configuration, built on the first connection attempt.
-    connector: Option<Option<Connector>>,
+    // TLS settings shared by all connection attempts.
+    tls: TlsContext,
     // Timestamp of the last traced outbound message (msg_tracing_out).
     last_msg_send_time: Option<Instant>,
 }
@@ -142,6 +142,7 @@ where
                 .map_err(|e| Error::InvalidRequest(e.to_string()))?,
             id: id.into(),
             machine: Machine::new(CoreConfig::from(&config)),
+            tls: TlsContext::new(&config),
             config,
             handler,
             transport,
@@ -155,7 +156,6 @@ where
             pending_stream: None,
             pending_connect: None,
             url_provider: None,
-            connector: None,
             last_msg_send_time: None,
         })
     }
@@ -304,23 +304,17 @@ where
             ctx.cancel_future(handle);
         }
 
-        // Per-attempt URL refresh hook (e.g. DNS/IP cache of the consumer), then the
-        // TLS connector (built once, on the first attempt).
-        let prepared = self.refresh_request().and_then(|_| self.tls_connector());
-        let connector = match prepared {
-            Ok(connector) => connector,
-            Err(error) => {
-                // Invalid refreshed URL or TLS configuration: fail this attempt through
-                // the normal path, as an immediately-failing connect task.
-                let handle =
-                    ctx.spawn(wrap_future::<_, Self>(async {}).map(move |_, actor, ctx| {
-                        actor.connect_handle = None;
-                        actor.dispatch(Event::ConnectFailed { generation, error }, ctx);
-                    }));
-                self.connect_handle = Some(handle);
-                return;
-            }
-        };
+        // Per-attempt URL refresh hook (e.g. DNS/IP cache of the consumer).
+        if let Err(error) = self.refresh_request() {
+            // Invalid refreshed URL: fail this attempt through the normal path, as
+            // an immediately-failing connect task.
+            let handle = ctx.spawn(wrap_future::<_, Self>(async {}).map(move |_, actor, ctx| {
+                actor.connect_handle = None;
+                actor.dispatch(Event::ConnectFailed { generation, error }, ctx);
+            }));
+            self.connect_handle = Some(handle);
+            return;
+        }
 
         debug!("[{}] Connecting (#{generation})", self.id);
 
@@ -335,7 +329,7 @@ where
             timeout,
             max_redirects: self.config.max_redirects,
             ws_config,
-            connector,
+            tls: self.tls.clone(),
         };
         let future = self.transport.connect(self.request.clone(), options);
         let handle = ctx.spawn(
@@ -357,16 +351,6 @@ where
             }),
         );
         self.connect_handle = Some(handle);
-    }
-
-    /// Returns the TLS connector for the configuration, building it on first use.
-    fn tls_connector(&mut self) -> Result<Option<Connector>, Error> {
-        if let Some(connector) = &self.connector {
-            return Ok(connector.clone());
-        }
-        let connector = build_connector(&self.config)?;
-        self.connector = Some(connector.clone());
-        Ok(connector)
     }
 
     /// Polls the URL provider and swaps the request URL if a new one is supplied.
@@ -1351,7 +1335,8 @@ mod tests {
 
         let attempts = attempts.lock().unwrap();
         // A dedicated connector without verification replaces the transport default.
-        assert!(attempts[0].options.connector.is_some());
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        assert!(attempts[0].options.tls.connector().unwrap().is_some());
     }
 
     #[actix_rt::test]
@@ -1376,6 +1361,6 @@ mod tests {
         // TLS verification is on by default
         // native-tls: the transport's default connector (system roots, full verification).
         #[cfg(feature = "native-tls")]
-        assert!(attempts[0].options.connector.is_none());
+        assert!(attempts[0].options.tls.connector().unwrap().is_none());
     }
 }

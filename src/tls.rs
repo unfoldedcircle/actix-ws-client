@@ -11,8 +11,15 @@
 //! configuration is supplied with [`TlsConnector::Rustls`]. Without any TLS feature
 //! only plain `ws://` connections are possible.
 
+// Without a TLS backend the connector plumbing is compiled but never used.
+#![cfg_attr(
+    not(any(feature = "native-tls", feature = "rustls-platform-verifier")),
+    allow(dead_code)
+)]
+
 use crate::Error;
 use crate::config::WebSocketConfig;
+use std::sync::{Arc, OnceLock};
 
 /// The transport's TLS connector type.
 #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
@@ -90,11 +97,42 @@ impl std::fmt::Debug for TlsConnector {
     }
 }
 
-/// Builds the TLS connector for the given configuration.
+/// TLS settings of a client, shared by all its connection attempts.
 ///
-/// Returns `None` if the transport's default applies: with `native-tls`, a connector
-/// with system CA roots and full verification.
-pub(crate) fn build_connector(config: &WebSocketConfig) -> Result<Option<Connector>, Error> {
+/// The connector is built on first use — only when a `wss://` target is actually
+/// connected, so plain `ws://` connections never depend on the TLS setup — and then
+/// reused for every further attempt.
+#[derive(Clone)]
+pub(crate) struct TlsContext(Arc<TlsContextInner>);
+
+struct TlsContextInner {
+    config: WebSocketConfig,
+    connector: OnceLock<Option<Connector>>,
+}
+
+impl TlsContext {
+    pub(crate) fn new(config: &WebSocketConfig) -> Self {
+        Self(Arc::new(TlsContextInner {
+            config: config.clone(),
+            connector: OnceLock::new(),
+        }))
+    }
+
+    /// Returns the TLS connector, building it on first use.
+    ///
+    /// `None` means the transport's default applies: with `native-tls`, a connector
+    /// with system CA roots and full verification. A failed build is not cached.
+    pub(crate) fn connector(&self) -> Result<Option<Connector>, Error> {
+        if let Some(connector) = self.0.connector.get() {
+            return Ok(connector.clone());
+        }
+        let connector = build_connector(&self.0.config)?;
+        Ok(self.0.connector.get_or_init(|| connector).clone())
+    }
+}
+
+/// Builds the TLS connector for the given configuration.
+fn build_connector(config: &WebSocketConfig) -> Result<Option<Connector>, Error> {
     #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
     if let Some(connector) = &config.tls_connector {
         return Ok(Some(match connector.clone() {
@@ -137,8 +175,6 @@ fn build_default_connector(config: &WebSocketConfig) -> Result<Option<Connector>
     use rustls::client::danger::ServerCertVerifier;
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject;
-    use std::sync::Arc;
-
     let provider = rustls::crypto::CryptoProvider::get_default()
         .cloned()
         .ok_or_else(|| {
