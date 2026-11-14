@@ -154,12 +154,18 @@ pub struct WebSocketConfig {
 
     /// Log every received text message at debug level.
     ///
+    /// Messages can be redacted or skipped with
+    /// [`crate::WebSocketMessageHandler::redact_trace`].
+    ///
     /// Default is false.
     #[builder(default = "false")]
     pub(crate) msg_tracing_in: bool,
 
     /// Log every sent text message at debug level, with the elapsed time since the
     /// previous sent message.
+    ///
+    /// Messages can be redacted or skipped with
+    /// [`crate::WebSocketMessageHandler::redact_trace`].
     ///
     /// Default is false.
     #[builder(default = "false")]

@@ -16,7 +16,7 @@ use crate::core::effect::{Callback, Effect};
 use crate::core::event::{Event, Frame};
 use crate::core::{CoreConfig, Machine};
 use crate::error::Error;
-use crate::handler::{HandlerAction, WebSocketMessageHandler};
+use crate::handler::{HandlerAction, TraceDirection, WebSocketMessageHandler};
 use crate::message::{Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
 use crate::tls::{Connector, build_connector};
 use actix::fut::{ActorFutureExt, wrap_future};
@@ -265,6 +265,7 @@ where
         };
         if self.config.msg_tracing_out
             && let Message::Text(text) = &item.msg
+            && let Some(text) = self.handler.redact_trace(TraceDirection::Outgoing, text)
         {
             let elapsed = self
                 .last_msg_send_time
@@ -470,7 +471,9 @@ where
     fn emit(&mut self, callback: Callback) -> Vec<HandlerAction> {
         match callback {
             Callback::OnText(text) => {
-                if self.config.msg_tracing_in {
+                if self.config.msg_tracing_in
+                    && let Some(text) = self.handler.redact_trace(TraceDirection::Incoming, &text)
+                {
                     debug!("[{}] -> {text}", self.id);
                 }
                 self.handler.on_text(text)
@@ -708,6 +711,17 @@ mod tests {
         fn on_reconnect_exhausted(&mut self) {
             self.log.lock().unwrap().push("exhausted".into());
         }
+        fn redact_trace<'a>(
+            &self,
+            direction: TraceDirection,
+            text: &'a str,
+        ) -> Option<std::borrow::Cow<'a, str>> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("trace:{direction:?}:{text}"));
+            None
+        }
     }
 
     fn config() -> WebSocketConfig {
@@ -769,6 +783,68 @@ mod tests {
             .unbounded_send(Ok(Message::Text("world".into())))
             .unwrap();
         wait_until(|| handler.log_contains("text:world"), "inbound text").await;
+    }
+
+    #[actix_rt::test]
+    async fn traced_messages_pass_the_redaction_hook() {
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let config = WebSocketConfig::builder()
+            .msg_tracing_in(true)
+            .msg_tracing_out(true)
+            .build()
+            .unwrap();
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            "ws://localhost",
+            config,
+            handler.clone(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .start();
+        addr.send(Connect).await.unwrap().unwrap();
+
+        addr.send(SendText::new("secret")).await.unwrap().unwrap();
+        script
+            .unbounded_send(Ok(Message::Text("reply".into())))
+            .unwrap();
+        wait_until(|| handler.log_contains("text:reply"), "inbound text").await;
+
+        assert!(handler.log_contains("trace:Outgoing:secret"));
+        assert!(handler.log_contains("trace:Incoming:reply"));
+        // The hook only affects the log: the message itself is sent unchanged.
+        assert!(sent_contains(
+            &sent,
+            |m| matches!(m, Message::Text(t) if t.as_str() == "secret")
+        ));
+    }
+
+    #[actix_rt::test]
+    async fn redaction_hook_is_not_called_without_message_tracing() {
+        let (sink, _sent) = mock_sink(usize::MAX);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        addr.send(SendText::new("hello")).await.unwrap().unwrap();
+        script
+            .unbounded_send(Ok(Message::Text("world".into())))
+            .unwrap();
+        wait_until(|| handler.log_contains("text:world"), "inbound text").await;
+
+        assert!(
+            !handler
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("trace:"))
+        );
     }
 
     #[actix_rt::test]

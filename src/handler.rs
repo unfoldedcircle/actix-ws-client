@@ -2,6 +2,16 @@
 
 use crate::Error;
 use bytes::Bytes;
+use std::borrow::Cow;
+
+/// Direction of a text message that is about to be logged by message tracing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceDirection {
+    /// A message received from the server (`msg_tracing_in`).
+    Incoming,
+    /// A message sent to the server (`msg_tracing_out`).
+    Outgoing,
+}
 
 /// An action returned from a handler callback, executed by the client actor right
 /// after the callback returns (same invocation — effectively synchronous).
@@ -61,6 +71,20 @@ pub trait WebSocketMessageHandler: Send + Unpin + 'static {
     /// Called when an error occurs.
     #[allow(unused_variables)]
     fn on_error(&mut self, error: &Error) {}
+    /// Called before a text message is logged by message tracing
+    /// ([`crate::WebSocketConfig`] `msg_tracing_in` / `msg_tracing_out`), to keep
+    /// secrets out of the log.
+    ///
+    /// Return the text to log — the message itself or a redacted copy — or `None` to
+    /// not log this message at all. Only the log output is affected, never the
+    /// message on the wire. Not called while message tracing is disabled.
+    ///
+    /// The default implementation logs every message unchanged.
+    #[allow(unused_variables)]
+    fn redact_trace<'a>(&self, direction: TraceDirection, text: &'a str) -> Option<Cow<'a, str>> {
+        Some(Cow::Borrowed(text))
+    }
+
     /// Called when the configured maximum number of reconnection attempts
     /// ([`crate::WebSocketConfig`] `max_reconnect_attempts`) has been reached.
     ///
