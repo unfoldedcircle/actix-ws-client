@@ -55,7 +55,8 @@ pub enum HandlerAction {
     /// failure) where retrying would be pointless.
     Disconnect,
     /// Like [`HandlerAction::Disconnect`], with a specific close status code and
-    /// reason in the close frame — same semantics as the [`crate::Close`] message.
+    /// reason in the close frame, optionally followed by a reconnect according to the
+    /// reconnect policy — same semantics as the [`crate::Close`] message.
     /// An invalid code or a too long reason is logged and replaced by a normal
     /// close (1000).
     Close {
@@ -63,6 +64,9 @@ pub enum HandlerAction {
         code: u16,
         /// The close reason, see [`crate::Close`].
         reason: String,
+        /// Reconnect according to the reconnect policy after closing instead of
+        /// stopping, see [`crate::Close::with_reconnect`].
+        reconnect: bool,
     },
     /// Gracefully close the connection and reconnect according to the reconnect
     /// policy — same semantics as the [`crate::Reconnect`] message. Use to recover

@@ -48,6 +48,8 @@ pub(crate) enum Event {
     CloseRequested {
         /// Status code and reason to send in the close frame.
         close: CloseInfo,
+        /// Reconnect according to the reconnect policy instead of stopping.
+        reconnect: bool,
     },
     /// The user requested to drop the current connection and establish a new one
     /// ([`crate::Reconnect`] message or [`crate::HandlerAction::Reconnect`]).

@@ -134,7 +134,14 @@ impl Machine {
         match event {
             Event::ConnectRequested => self.on_connect_requested(),
             Event::DisconnectRequested => self.on_disconnect_requested(None),
-            Event::CloseRequested { close } => self.on_disconnect_requested(Some(close)),
+            Event::CloseRequested {
+                close,
+                reconnect: false,
+            } => self.on_disconnect_requested(Some(close)),
+            Event::CloseRequested {
+                close,
+                reconnect: true,
+            } => self.on_close_and_reconnect_requested(close, now),
             Event::ReconnectRequested => self.on_reconnect_requested(),
             Event::ConnectSucceeded { generation } => self.on_connect_succeeded(generation, now),
             Event::ConnectFailed { generation, error } => self.on_connect_failed(generation, error),
@@ -198,6 +205,24 @@ impl Machine {
             }
             ConnState::Disconnected => Vec::new(),
         }
+    }
+
+    /// Closes an established connection with the given status, then follows the
+    /// reconnect policy as if the connection had been lost (backoff, flapping
+    /// protection, attempt cap). Without an established connection there is nothing
+    /// to close and the current state is kept.
+    fn on_close_and_reconnect_requested(&mut self, close: CloseInfo, now: Instant) -> Vec<Effect> {
+        if self.state != ConnState::Connected {
+            return Vec::new();
+        }
+        if let Some(connected_at) = self.connected_at
+            && now.duration_since(connected_at) >= self.cfg.min_stable_uptime
+        {
+            self.reconnection_attempts = 0;
+        }
+        let mut effects = self.close_connected(Some(close));
+        self.schedule_reconnect_or_idle(&mut effects);
+        effects
     }
 
     fn on_reconnect_requested(&mut self) -> Vec<Effect> {
@@ -1232,6 +1257,7 @@ mod tests {
         let effects = m.on_event(
             Event::CloseRequested {
                 close: close.clone(),
+                reconnect: false,
             },
             now,
         );
@@ -1242,6 +1268,94 @@ mod tests {
         assert_eq!(closed_reason(&effects), DisconnectReason::ClosedLocally);
         assert_eq!(m.state(), ConnState::Disconnected);
         assert_eq!(reconnect_delay(&effects), None);
+    }
+
+    /// The reconnect timer fires and the new connection attempt succeeds.
+    fn reconnect_succeeds(m: &mut Machine, now: Instant) {
+        m.on_event(Event::ReconnectTimerFired, now);
+        let generation = m.generation();
+        m.on_event(Event::ConnectSucceeded { generation }, now);
+        assert_eq!(m.state(), ConnState::Connected);
+    }
+
+    fn close_and_reconnect(code: u16) -> Event {
+        Event::CloseRequested {
+            close: CloseInfo {
+                code,
+                reason: String::new(),
+            },
+            reconnect: true,
+        }
+    }
+
+    #[test]
+    fn close_with_reconnect_follows_the_backoff_policy() {
+        let mut m = machine();
+        let mut now = t0();
+
+        // A session that breaks right after connecting, again and again: the backoff
+        // grows instead of reconnecting immediately.
+        let mut delays = Vec::new();
+        connect(&mut m, now);
+        for _ in 0..3 {
+            now += Duration::from_secs(1);
+            let effects = m.on_event(close_and_reconnect(1002), now);
+            assert!(effects.contains(&Effect::SendFrame {
+                frame: Frame::Close(Some(CloseInfo {
+                    code: 1002,
+                    reason: String::new()
+                }))
+            }));
+            assert_eq!(closed_reason(&effects), DisconnectReason::ClosedLocally);
+            assert_eq!(m.state(), ConnState::WaitingToReconnect);
+            delays.push(reconnect_delay(&effects).expect("reconnect timer armed"));
+            reconnect_succeeds(&mut m, now);
+        }
+        assert_eq!(
+            delays,
+            vec![INITIAL_BACKOFF, INITIAL_BACKOFF * 2, INITIAL_BACKOFF * 4]
+        );
+    }
+
+    #[test]
+    fn close_with_reconnect_after_stable_uptime_restarts_the_backoff() {
+        let mut m = machine();
+        let mut now = t0();
+        connect(&mut m, now);
+        now += Duration::from_secs(1);
+        m.on_event(close_and_reconnect(1002), now);
+
+        reconnect_succeeds(&mut m, now);
+        now += MIN_STABLE_UPTIME;
+        let effects = m.on_event(close_and_reconnect(1002), now);
+
+        assert_eq!(reconnect_delay(&effects), Some(INITIAL_BACKOFF));
+    }
+
+    #[test]
+    fn close_with_reconnect_respects_the_attempt_cap() {
+        let mut m = machine_with_cap(1);
+        let now = t0();
+        connect(&mut m, now);
+        m.on_event(close_and_reconnect(1002), now);
+        reconnect_succeeds(&mut m, now);
+
+        let effects = m.on_event(close_and_reconnect(1002), now);
+
+        assert!(effects.contains(&Effect::Emit(Callback::OnReconnectExhausted)));
+        assert_eq!(m.state(), ConnState::Disconnected);
+    }
+
+    #[test]
+    fn close_with_reconnect_without_a_connection_changes_nothing() {
+        let mut m = machine();
+        let now = t0();
+        assert!(m.on_event(close_and_reconnect(1002), now).is_empty());
+        assert_eq!(m.state(), ConnState::Disconnected);
+
+        m.on_event(Event::ConnectRequested, now);
+        assert!(m.on_event(close_and_reconnect(1002), now).is_empty());
+        assert_eq!(m.state(), ConnState::Connecting);
     }
 
     #[test]
@@ -1264,6 +1378,7 @@ mod tests {
                     code: 1000,
                     reason: String::new(),
                 },
+                reconnect: false,
             },
             now,
         );

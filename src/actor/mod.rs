@@ -242,17 +242,22 @@ where
             HandlerAction::Disconnect => {
                 self.dispatch(Event::DisconnectRequested, ctx);
             }
-            HandlerAction::Close { code, reason } => {
-                let event = match validate_close(code, &reason) {
-                    Ok(()) => Event::CloseRequested {
-                        close: CloseInfo { code, reason },
-                    },
+            HandlerAction::Close {
+                code,
+                reason,
+                reconnect,
+            } => {
+                let close = match validate_close(code, &reason) {
+                    Ok(()) => CloseInfo { code, reason },
                     Err(error) => {
                         warn!("[{}] {error}: closing with a normal closure", self.id);
-                        Event::DisconnectRequested
+                        CloseInfo {
+                            code: 1000,
+                            reason: String::new(),
+                        }
                     }
                 };
-                self.dispatch(event, ctx);
+                self.dispatch(Event::CloseRequested { close, reconnect }, ctx);
             }
             HandlerAction::Reconnect => {
                 self.dispatch(Event::ReconnectRequested, ctx);
@@ -628,6 +633,7 @@ impl<H: WebSocketMessageHandler> Handler<Close> for GenericWebSocketClient<H> {
                     code: msg.code,
                     reason: msg.reason,
                 },
+                reconnect: msg.reconnect,
             },
             ctx,
         );
@@ -1098,6 +1104,7 @@ mod tests {
         handler.set_text_actions(vec![HandlerAction::Close {
             code: 1003,
             reason: "binary not supported".into(),
+            reconnect: false,
         }]);
         let addr = client(transport, handler.clone());
         addr.send(Connect).await.unwrap().unwrap();
@@ -1115,6 +1122,34 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn close_with_reconnect_establishes_a_new_connection_after_the_backoff() {
+        let (sink1, sent1) = mock_sink(usize::MAX);
+        let (_script1, stream1) = scripted_stream();
+        let (sink2, _sent2) = mock_sink(usize::MAX);
+        let (_script2, stream2) = scripted_stream();
+        let (transport, attempts) =
+            MockTransport::scripted(vec![Ok((sink1, stream1)), Ok((sink2, stream2))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        addr.send(Close::new(1002, "unexpected message").with_reconnect())
+            .await
+            .unwrap()
+            .unwrap();
+
+        wait_until(
+            || sent_close(&sent1, 1002, "unexpected message"),
+            "close frame written",
+        )
+        .await;
+        // not immediately: the reconnect waits for the backoff delay
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+        wait_until(|| handler.count("connected") == 2, "reconnected").await;
+        assert_eq!(handler.count("disconnected"), 1);
+    }
+
+    #[actix_rt::test]
     async fn invalid_close_action_falls_back_to_a_normal_closure() {
         let (sink, sent) = mock_sink(usize::MAX);
         let (script, stream) = scripted_stream();
@@ -1123,6 +1158,7 @@ mod tests {
         handler.set_text_actions(vec![HandlerAction::Close {
             code: 1005,
             reason: String::new(),
+            reconnect: false,
         }]);
         let addr = client(transport, handler.clone());
         addr.send(Connect).await.unwrap().unwrap();

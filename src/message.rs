@@ -59,6 +59,13 @@ pub struct Disconnect;
 /// Same semantics as [`Disconnect`], which closes with status 1000 (normal closure)
 /// and no reason. Without an established connection no close frame is sent.
 ///
+/// With [`Close::with_reconnect`] the client does not stop: after closing it reconnects
+/// according to the reconnect policy, as if the connection had been lost — with
+/// backoff, flapping protection and the attempt cap. Use it to give up on a broken
+/// session (e.g. a protocol error) without hammering the server; in contrast,
+/// [`Reconnect`] reconnects immediately with a fresh attempt counter. It has no effect
+/// without an established connection.
+///
 /// Fails with [`Error::InvalidRequest`], without closing, if the status code may not
 /// be sent in a close frame (RFC 6455 §7.4: allowed are 1000–1003, 1007–1014 and
 /// 3000–4999) or the reason is longer than 123 bytes.
@@ -69,15 +76,24 @@ pub struct Close {
     pub code: u16,
     /// The close reason; may be empty.
     pub reason: String,
+    /// Reconnect according to the reconnect policy after closing, instead of stopping.
+    pub reconnect: bool,
 }
 
 impl Close {
-    /// Creates a new close message.
+    /// Creates a new close message that stops reconnecting, like [`Disconnect`].
     pub fn new(code: u16, reason: impl Into<String>) -> Self {
         Self {
             code,
             reason: reason.into(),
+            reconnect: false,
         }
+    }
+
+    /// Reconnect according to the reconnect policy after closing, instead of stopping.
+    pub fn with_reconnect(mut self) -> Self {
+        self.reconnect = true;
+        self
     }
 }
 

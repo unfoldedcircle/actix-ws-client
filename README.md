@@ -54,8 +54,8 @@ TLS options of `WebSocketConfig`, working with both backends:
 - `WebSocketMessageHandler` — callback trait (`on_text`, `on_binary`, `on_connected`,
   `on_closed`, `on_disconnected`, `on_error`, `on_reconnect_exhausted`, `redact_trace`). `on_text` / `on_binary` /
   `on_connected` return a `Vec<HandlerAction>` executed by the client right after the
-  callback: `SendText`, `SendBinary`, `Disconnect` / `Close { code, reason }`
-  (terminal) or `Reconnect` (fresh connection). This lets a handler implement request/reply protocols (e.g. an
+  callback: `SendText`, `SendBinary`, `Disconnect` / `Close { code, reason, reconnect }`
+  (terminal, or reconnect per policy) or `Reconnect` (fresh connection). This lets a handler implement request/reply protocols (e.g. an
   authentication handshake) or disconnect on fatal messages without holding a client
   address — the handler stays a pure, unit-testable function of its input. Send
   actions returned while the connection is no longer up are dropped with a warning.
@@ -196,7 +196,12 @@ connected fail immediately with `Error::NotConnected`.
 **Sending.** `Disconnect` closes with status 1000 (normal closure) and no reason. The
 `Close::new(code, reason)` message and `HandlerAction::Close { code, reason }` close
 with a specific status, e.g. 1003 (unsupported data), 1008 (policy violation) or an
-application code 4000–4999. Both stop reconnecting, like `Disconnect`. A status that
+application code 4000–4999. Both stop reconnecting, like `Disconnect` — unless
+`Close::with_reconnect()` / `reconnect: true` is set: then the client reconnects
+according to the reconnect policy, as if the connection had been lost (backoff,
+flapping protection, attempt cap). That is the way to give up on a broken session
+without hammering the server; `Reconnect` in contrast reconnects immediately with a
+fresh attempt counter. A status that
 must not be sent (RFC 6455 §7.4, e.g. 1005, 1006) or a reason longer than 123 bytes is
 rejected: the message returns `Error::InvalidRequest` and leaves the connection
 untouched; the handler action logs a warning and closes with 1000.
