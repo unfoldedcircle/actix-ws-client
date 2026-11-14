@@ -1,0 +1,84 @@
+//! Output effects produced by the pure core state machine.
+
+use crate::Error;
+use crate::core::event::Frame;
+use bytes::Bytes;
+use std::time::Duration;
+
+/// A callback to be delivered to the user's [`crate::WebSocketMessageHandler`].
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, PartialEq)]
+pub(crate) enum Callback {
+    /// Deliver a received text frame.
+    OnText(String),
+    /// Deliver a received binary frame.
+    OnBinary(Bytes),
+    /// The connection was established (edge-triggered, balanced with `OnDisconnected`).
+    OnConnected,
+    /// The connection ended (edge-triggered, balanced with `OnConnected`).
+    OnDisconnected,
+    /// An error occurred.
+    OnError(Error),
+    /// The maximum number of reconnection attempts was reached; the client stops
+    /// reconnecting until a new connect/reconnect request.
+    OnReconnectExhausted,
+}
+
+/// An instruction from the core to the I/O adapter (the actor).
+///
+/// The core decides *what* should happen; the adapter executes it. Effects never carry
+/// I/O resources — the adapter owns those, keyed by generation.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Effect {
+    /// Start a connection attempt for `generation` with the given timeout.
+    ///
+    /// Executing this cancels any armed reconnect timer.
+    StartConnect {
+        /// Generation assigned to this attempt.
+        generation: u64,
+        /// Connect timeout (including redirects).
+        timeout: Duration,
+    },
+    /// Start the writer task owning the sink of connection `generation`.
+    StartWriterTask {
+        /// Generation of the connection.
+        generation: u64,
+    },
+    /// Start the reader task owning the stream of connection `generation`.
+    StartReaderTask {
+        /// Generation of the connection.
+        generation: u64,
+    },
+    /// Enqueue a core-originated frame (ping, pong reply, close) to the writer.
+    SendFrame {
+        /// The frame to send.
+        frame: Frame,
+    },
+    /// Tear down all per-connection resources of `generation`: drop the writer sender,
+    /// cancel the reader task, connect task, keep-alive and reconnect timers.
+    TearDownConnection {
+        /// Generation of the connection to tear down.
+        generation: u64,
+    },
+    /// Arm the reconnect timer with the given delay.
+    ArmReconnectTimer {
+        /// Backoff delay until the next connection attempt.
+        delay: Duration,
+    },
+    /// Start the keep-alive interval timer for connection `generation`.
+    StartKeepAlive {
+        /// Generation of the connection.
+        generation: u64,
+        /// Ping interval.
+        interval: Duration,
+    },
+    /// Stop the keep-alive timer.
+    StopKeepAlive,
+    /// Invoke a user callback.
+    Emit(Callback),
+    /// Resolve the pending [`crate::Connect`] request, if any.
+    CompleteConnect {
+        /// Result to deliver to the caller.
+        result: Result<(), Error>,
+    },
+}

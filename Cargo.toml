@@ -1,0 +1,27 @@
+[package]
+name = "actix-ws-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Actor-based WebSocket client for Actix with automatic reconnection and ping/pong keep-alive"
+repository = "https://github.com/unfoldedcircle/actix-ws-client"
+
+[dependencies]
+actix = "0.13"
+tokio = { version = "1.42", features = ["macros", "sync", "time"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+# Direct dependency to construct a custom TLS connector (`danger_accept_invalid_certs`);
+# already in the tree via the tokio-tungstenite `native-tls` feature.
+native-tls = "0.2"
+futures = "0.3"
+bytes = "1.7"
+log = "0.4.22"
+derive_builder = "0.20"
+fastrand = "2"
+
+[dev-dependencies]
+actix-rt = "2.10"
+env_logger = "0.11"
+rstest = "0.26.1"
+tokio = { version = "1.42", features = ["macros", "rt", "sync", "time", "test-util", "net", "io-util"] }
