@@ -111,6 +111,18 @@ pub struct WebSocketConfig {
     #[builder(default)]
     pub(crate) max_frame_size: Option<usize>,
 
+    /// Maximum number of messages waiting to be written to the socket.
+    ///
+    /// Messages are queued while the socket cannot take them as fast as they are
+    /// sent (slow network or peer). With a limit, a message that does not fit is
+    /// rejected with [`crate::Error::SendQueueFull`] instead of growing the queue —
+    /// useful for streamed data such as audio, where stale data is worthless.
+    /// Internal control frames (ping, pong, close) are never rejected.
+    ///
+    /// `None` (default) does not limit the queue.
+    #[builder(default)]
+    pub(crate) max_send_queue: Option<usize>,
+
     /// **Danger:** accept invalid TLS certificates and hostnames on `wss://` connections.
     ///
     /// Disables server certificate verification entirely (certificate chain *and*
@@ -204,6 +216,9 @@ impl WebSocketConfigBuilder {
             && interval.is_zero()
         {
             return Err("ping_interval must be > 0".into());
+        }
+        if self.max_send_queue == Some(Some(0)) {
+            return Err("max_send_queue must be >= 1".into());
         }
         if let Some(initial) = self.initial_backoff
             && initial.is_zero()
