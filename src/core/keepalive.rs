@@ -1,5 +1,8 @@
 //! Pure keep-alive tracker: counts consecutive unanswered pings.
 //!
+//! A ping counts as answered when any frame is received after it, not only its pong: a
+//! peer that is sending data is alive.
+//!
 //! Liveness is evaluated on the ping tick only — there is no second monitor timer and
 //! no moving reference instant. The detection budget is exactly
 //! `max_missed_pongs * ping_interval` after the first unanswered ping.
@@ -42,8 +45,8 @@ impl KeepAlive {
         KeepAliveOutcome::SendPing
     }
 
-    /// A pong was received: the connection is alive.
-    pub(crate) fn on_pong(&mut self) {
+    /// A frame was received (a pong or any other frame): the connection is alive.
+    pub(crate) fn on_activity(&mut self) {
         self.awaiting_pong = false;
         self.missed = 0;
     }
@@ -75,7 +78,7 @@ mod tests {
         let mut ka = KeepAlive::new(2);
         assert_eq!(ka.on_tick(), KeepAliveOutcome::SendPing);
         assert_eq!(ka.on_tick(), KeepAliveOutcome::SendPing); // 1 missed
-        ka.on_pong();
+        ka.on_activity();
         // counter cleared: the budget starts over
         assert_eq!(ka.on_tick(), KeepAliveOutcome::SendPing);
         assert_eq!(ka.on_tick(), KeepAliveOutcome::SendPing);
@@ -87,7 +90,7 @@ mod tests {
         let mut ka = KeepAlive::new(1);
         for _ in 0..100 {
             assert_eq!(ka.on_tick(), KeepAliveOutcome::SendPing);
-            ka.on_pong();
+            ka.on_activity();
         }
     }
 

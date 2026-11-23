@@ -2,6 +2,7 @@
 
 use crate::Error;
 use crate::core::event::Frame;
+use crate::handler::DisconnectReason;
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -15,6 +16,8 @@ pub(crate) enum Callback {
     OnBinary(Bytes),
     /// The connection was established (edge-triggered, balanced with `OnDisconnected`).
     OnConnected,
+    /// Why the connection ended; always directly followed by `OnDisconnected`.
+    OnClosed(DisconnectReason),
     /// The connection ended (edge-triggered, balanced with `OnConnected`).
     OnDisconnected,
     /// An error occurred.

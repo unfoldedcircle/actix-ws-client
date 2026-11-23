@@ -75,7 +75,7 @@ mod tests {
                 ReaderEvent::Frame(Frame::Binary(Bytes::from_static(b"\x01"))),
                 ReaderEvent::Frame(Frame::Ping(Bytes::from_static(b"p"))),
                 ReaderEvent::Frame(Frame::Pong(Bytes::new())),
-                ReaderEvent::Frame(Frame::Close),
+                ReaderEvent::Frame(Frame::Close(None)),
                 ReaderEvent::Ended(None),
             ]
         );

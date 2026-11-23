@@ -4,12 +4,14 @@
 //! implementation to drive the client deterministically without TCP.
 
 use crate::Error;
-use crate::core::event::Frame;
+use crate::core::event::{CloseInfo, Frame};
+use crate::tls::TlsContext;
 use futures::stream::StreamExt;
 use futures::{Sink, Stream};
 use log::debug;
 use std::pin::Pin;
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -20,7 +22,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig as WsProtocolConfig;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::{Connector, connect_async_tls_with_config};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 /// Boxed message sink of an established connection (owned by the writer task).
 pub(crate) type BoxSink = Pin<Box<dyn Sink<Message, Error = WsError> + Send>>;
@@ -30,8 +32,14 @@ pub(crate) type BoxStream = Pin<Box<dyn Stream<Item = Result<Message, WsError>> 
 pub(crate) type ConnectFuture =
     Pin<Box<dyn Future<Output = Result<(BoxSink, BoxStream), Error>> + Send>>;
 
+/// An established connection with the handshake response.
+type Connection = (
+    WebSocketStream<MaybeTlsStream<TcpStream>>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+);
+
 /// Options for a single connection attempt.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub(crate) struct ConnectOptions {
     /// Timeout for the whole attempt (including redirects).
     pub timeout: Duration,
@@ -39,9 +47,12 @@ pub(crate) struct ConnectOptions {
     pub max_redirects: u8,
     /// WebSocket protocol configuration (frame/message size limits etc.).
     pub ws_config: WsProtocolConfig,
-    /// Accept invalid TLS certificates and hostnames (wss only). See
-    /// [`crate::WebSocketConfig::danger_accept_invalid_certs`].
-    pub danger_accept_invalid_certs: bool,
+    /// TLS settings for `wss://` targets.
+    #[cfg_attr(
+        not(any(feature = "native-tls", feature = "rustls-platform-verifier")),
+        allow(dead_code)
+    )]
+    pub tls: TlsContext,
 }
 
 /// Connects a WebSocket and returns the split transport halves.
@@ -68,22 +79,6 @@ impl Transport for TungsteniteTransport {
     }
 }
 
-/// Builds the TLS connector for a connection attempt.
-///
-/// Returns `None` (tungstenite's default connector: native-tls with system CA roots and
-/// full verification) unless certificate verification is disabled.
-fn build_connector(danger_accept_invalid_certs: bool) -> Result<Option<Connector>, Error> {
-    if !danger_accept_invalid_certs {
-        return Ok(None);
-    }
-    let tls = native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .build()
-        .map_err(|e| Error::WebSocket(format!("Cannot build TLS connector: {e}")))?;
-    Ok(Some(Connector::NativeTls(tls)))
-}
-
 /// Attempts to establish a websocket connection, following HTTP redirects up to
 /// `options.max_redirects`.
 async fn connect_follow_redirects(
@@ -92,20 +87,13 @@ async fn connect_follow_redirects(
 ) -> Result<(BoxSink, BoxStream), Error> {
     let mut max_redirects = options.max_redirects;
     loop {
-        let connector = build_connector(options.danger_accept_invalid_certs)?;
-        match connect_async_tls_with_config(
-            request.clone(),
-            Some(options.ws_config),
-            false,
-            connector,
-        )
-        .await
-        {
-            Ok((ws_stream, _resp)) => {
+        match connect(request.clone(), &options).await? {
+            Attempt::Connected(connection) => {
+                let (ws_stream, _resp) = *connection;
                 let (sink, stream) = ws_stream.split();
                 return Ok((Box::pin(sink), Box::pin(stream)));
             }
-            Err(WsError::Http(resp)) if is_redirect(resp.status()) => {
+            Attempt::Failed(WsError::Http(resp)) if is_redirect(resp.status()) => {
                 if max_redirects == 0 {
                     return Err(Error::WebSocket(format!(
                         "Too many redirects (stopped at {})",
@@ -129,12 +117,49 @@ async fn connect_follow_redirects(
                 request = build_redirect_request(&request, location)?;
                 max_redirects -= 1;
             }
-            Err(WsError::Http(resp)) => {
-                return Err(Error::WebSocket(format!("HTTP error: {}", resp.status())));
-            }
-            Err(e) => return Err(Error::from(e)),
+            Attempt::Failed(e) => return Err(Error::from(e)),
         }
     }
+}
+
+/// Result of a single connection attempt.
+enum Attempt {
+    Connected(Box<Connection>),
+    /// The transport failed; a redirect response is handled by the caller.
+    Failed(WsError),
+}
+
+/// A single connection attempt. The TLS connector is only set up for a `wss://`
+/// target, so plain `ws://` connections never depend on the TLS configuration.
+#[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
+async fn connect(request: WsRequest, options: &ConnectOptions) -> Result<Attempt, Error> {
+    let connector = if request.uri().scheme_str() == Some("wss") {
+        options.tls.connector()?
+    } else {
+        None
+    };
+    let result = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        Some(options.ws_config),
+        false,
+        connector,
+    )
+    .await;
+    Ok(match result {
+        Ok(connection) => Attempt::Connected(Box::new(connection)),
+        Err(e) => Attempt::Failed(e),
+    })
+}
+
+/// A single connection attempt without a TLS backend: plain `ws://` only.
+#[cfg(not(any(feature = "native-tls", feature = "rustls-platform-verifier")))]
+async fn connect(request: WsRequest, options: &ConnectOptions) -> Result<Attempt, Error> {
+    let result =
+        tokio_tungstenite::connect_async_with_config(request, Some(options.ws_config), false).await;
+    Ok(match result {
+        Ok(connection) => Attempt::Connected(Box::new(connection)),
+        Err(e) => Attempt::Failed(e),
+    })
 }
 
 fn is_redirect(status: StatusCode) -> bool {
@@ -209,9 +234,29 @@ pub(crate) fn frame_from_message(msg: Message) -> Option<Frame> {
         Message::Binary(data) => Some(Frame::Binary(data)),
         Message::Ping(payload) => Some(Frame::Ping(payload)),
         Message::Pong(payload) => Some(Frame::Pong(payload)),
-        Message::Close(_) => Some(Frame::Close),
+        Message::Close(close) => Some(Frame::Close(close.map(|close| CloseInfo {
+            code: close.code.into(),
+            reason: close.reason.as_str().to_owned(),
+        }))),
         Message::Frame(_) => None,
     }
+}
+
+/// Validates the status code and reason of a close frame to send (RFC 6455 §7.4, §5.5).
+pub(crate) fn validate_close(code: u16, reason: &str) -> Result<(), Error> {
+    if !CloseCode::from(code).is_allowed() {
+        return Err(Error::InvalidRequest(format!(
+            "close code {code} must not be sent in a close frame"
+        )));
+    }
+    // A control frame carries at most 125 bytes: 2 bytes status code + reason.
+    if reason.len() > 123 {
+        return Err(Error::InvalidRequest(format!(
+            "close reason too long: {} bytes (max 123)",
+            reason.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Converts a core [`Frame`] into a tungstenite message for sending.
@@ -221,9 +266,13 @@ pub(crate) fn message_from_frame(frame: Frame) -> Message {
         Frame::Binary(data) => Message::Binary(data),
         Frame::Ping(payload) => Message::Ping(payload),
         Frame::Pong(payload) => Message::Pong(payload),
-        Frame::Close => Message::Close(Some(CloseFrame {
+        Frame::Close(None) => Message::Close(Some(CloseFrame {
             code: CloseCode::Normal,
             reason: Utf8Bytes::from(String::new()),
+        })),
+        Frame::Close(Some(close)) => Message::Close(Some(CloseFrame {
+            code: CloseCode::from(close.code),
+            reason: Utf8Bytes::from(close.reason),
         })),
     }
 }
@@ -314,8 +363,11 @@ mod tests {
             Some(Frame::Binary(data))
         );
         assert_eq!(
-            frame_from_message(message_from_frame(Frame::Close)),
-            Some(Frame::Close)
+            frame_from_message(message_from_frame(Frame::Close(None))),
+            Some(Frame::Close(Some(CloseInfo {
+                code: 1000,
+                reason: String::new()
+            })))
         );
     }
 }

@@ -14,6 +14,13 @@
 //! Actix adapter (`actor`) executes the machine's effects and feeds real-world
 //! happenings back as events. See `README.md` for the full design description.
 //!
+//! ## TLS
+//!
+//! The TLS backend for `wss://` connections is selected with cargo features:
+//! `native-tls` (default) or `rustls-platform-verifier`. With rustls the application
+//! must install a `CryptoProvider`. See `README.md` for the details and the TLS
+//! options of [`WebSocketConfig`].
+//!
 //! ## Callback contract
 //!
 //! [`WebSocketMessageHandler::on_connected`] and
@@ -69,9 +76,13 @@ mod core;
 mod error;
 mod handler;
 mod message;
+mod tls;
 
 pub use actor::GenericWebSocketClient;
 pub use config::{WebSocketConfig, WebSocketConfigBuilder, WebSocketConfigBuilderError};
 pub use error::Error;
-pub use handler::{HandlerAction, WebSocketMessageHandler};
-pub use message::{Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
+pub use handler::{DisconnectReason, HandlerAction, TraceDirection, WebSocketMessageHandler};
+pub use message::{Close, Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
+pub use tls::Certificate;
+#[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
+pub use tls::TlsConnector;

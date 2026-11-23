@@ -1,5 +1,8 @@
 //! WebSocket client configuration.
 
+use crate::tls::Certificate;
+#[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
+use crate::tls::TlsConnector;
 use derive_builder::Builder;
 use std::time::Duration;
 
@@ -13,14 +16,25 @@ use std::time::Duration;
     build_fn(validate = "Self::validate")
 )]
 pub struct WebSocketConfig {
+    /// Whether the client sends WebSocket ping frames to detect a dead connection.
+    ///
+    /// Disable it for servers that require an application-level heartbeat instead:
+    /// the consumer then sends its own heartbeat messages and requests a
+    /// [`crate::HandlerAction::Reconnect`] or sends [`crate::Reconnect`] when the
+    /// server stops answering. Pings of the server are answered in any case.
+    ///
+    /// Default is true.
+    #[builder(default = "true")]
+    pub(crate) ping_enabled: bool,
     /// Interval between pings sent by the client.
     ///
     /// Default is 30 seconds.
     #[builder(default = "Duration::from_secs(30)")]
     pub(crate) ping_interval: Duration,
-    /// Number of consecutive missed pongs before triggering a reconnect.
+    /// Number of consecutive unanswered pings before triggering a reconnect.
     ///
-    /// The keep-alive detection budget is `max_missed_pongs * ping_interval`.
+    /// A ping counts as answered when any frame is received after it, not only its
+    /// pong. The keep-alive detection budget is `max_missed_pongs * ping_interval`.
     ///
     /// Default is 2.
     #[builder(default = "2")]
@@ -97,17 +111,63 @@ pub struct WebSocketConfig {
     #[builder(default)]
     pub(crate) max_frame_size: Option<usize>,
 
+    /// Maximum number of messages waiting to be written to the socket.
+    ///
+    /// Messages are queued while the socket cannot take them as fast as they are
+    /// sent (slow network or peer). With a limit, a message that does not fit is
+    /// rejected with [`crate::Error::SendQueueFull`] instead of growing the queue —
+    /// useful for streamed data such as audio, where stale data is worthless.
+    /// Internal control frames (ping, pong, close) are never rejected.
+    ///
+    /// `None` (default) does not limit the queue.
+    #[builder(default)]
+    pub(crate) max_send_queue: Option<usize>,
+
     /// **Danger:** accept invalid TLS certificates and hostnames on `wss://` connections.
     ///
     /// Disables server certificate verification entirely (certificate chain *and*
     /// hostname) — intended for development and testing against self-signed
     /// certificates only. Has no effect on plain `ws://` connections.
     ///
+    /// Works with every TLS backend.
+    ///
     /// Default is false (full verification against the system CA store).
     #[builder(default = "false")]
+    #[cfg_attr(
+        not(any(feature = "native-tls", feature = "rustls-platform-verifier")),
+        allow(dead_code)
+    )]
     pub(crate) danger_accept_invalid_certs: bool,
 
+    /// Additional trusted root certificates for `wss://` connections, on top of the
+    /// system CA store.
+    ///
+    /// Use it for a private certificate authority or the self-signed certificate of a
+    /// server. See also [`WebSocketConfigBuilder::add_root_certificate`].
+    ///
+    /// Default is empty.
+    #[builder(default)]
+    #[cfg_attr(
+        not(any(feature = "native-tls", feature = "rustls-platform-verifier")),
+        allow(dead_code)
+    )]
+    pub(crate) root_certificates: Vec<Certificate>,
+
+    /// A ready-made TLS configuration for `wss://` connections.
+    ///
+    /// Replaces the connector the client builds itself, for full control over the TLS
+    /// setup (client certificates, protocol versions, a custom verifier, ...). Cannot
+    /// be combined with `danger_accept_invalid_certs` or `root_certificates`.
+    ///
+    /// Default is `None`.
+    #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
+    #[builder(default)]
+    pub(crate) tls_connector: Option<TlsConnector>,
+
     /// Log every received text message at debug level.
+    ///
+    /// Messages can be redacted or skipped with
+    /// [`crate::WebSocketMessageHandler::redact_trace`].
     ///
     /// Default is false.
     #[builder(default = "false")]
@@ -115,6 +175,9 @@ pub struct WebSocketConfig {
 
     /// Log every sent text message at debug level, with the elapsed time since the
     /// previous sent message.
+    ///
+    /// Messages can be redacted or skipped with
+    /// [`crate::WebSocketMessageHandler::redact_trace`].
     ///
     /// Default is false.
     #[builder(default = "false")]
@@ -129,6 +192,15 @@ impl WebSocketConfig {
 }
 
 impl WebSocketConfigBuilder {
+    /// Adds a trusted root certificate for `wss://` connections, see
+    /// `root_certificates`.
+    pub fn add_root_certificate(mut self, certificate: Certificate) -> Self {
+        self.root_certificates
+            .get_or_insert_with(Vec::new)
+            .push(certificate);
+        self
+    }
+
     fn validate(&self) -> Result<(), String> {
         if let Some(factor) = self.backoff_factor
             && (factor < 1.0 || !factor.is_finite())
@@ -145,10 +217,26 @@ impl WebSocketConfigBuilder {
         {
             return Err("ping_interval must be > 0".into());
         }
+        if self.max_send_queue == Some(Some(0)) {
+            return Err("max_send_queue must be >= 1".into());
+        }
         if let Some(initial) = self.initial_backoff
             && initial.is_zero()
         {
             return Err("initial_backoff must be > 0".into());
+        }
+        #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
+        if matches!(self.tls_connector, Some(Some(_)))
+            && (self.danger_accept_invalid_certs == Some(true)
+                || self
+                    .root_certificates
+                    .as_ref()
+                    .is_some_and(|c| !c.is_empty()))
+        {
+            return Err(
+                "tls_connector cannot be combined with danger_accept_invalid_certs or root_certificates"
+                    .into(),
+            );
         }
         Ok(())
     }

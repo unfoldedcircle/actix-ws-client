@@ -7,8 +7,8 @@
 
 use actix::prelude::*;
 use actix_ws_client::{
-    Connect, Disconnect, Error, GenericWebSocketClient, HandlerAction, IsConnected, SendBinary,
-    SendText, WebSocketConfig, WebSocketMessageHandler,
+    Close, Connect, Disconnect, DisconnectReason, Error, GenericWebSocketClient, HandlerAction,
+    IsConnected, SendBinary, SendText, WebSocketConfig, WebSocketMessageHandler,
 };
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 #[derive(Clone, Default)]
 struct RecordingHandler {
@@ -53,6 +55,14 @@ impl WebSocketMessageHandler for RecordingHandler {
     fn on_connected(&mut self) -> Vec<HandlerAction> {
         self.log.lock().unwrap().push("connected".into());
         Vec::new()
+    }
+    fn on_closed(&mut self, reason: &DisconnectReason) {
+        if let DisconnectReason::ClosedByServer { code, reason } = reason {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("closed-by-server:{code:?}:{reason}"));
+        }
     }
     fn on_disconnected(&mut self) {
         self.log.lock().unwrap().push("disconnected".into());
@@ -95,6 +105,41 @@ async fn spawn_echo_server() -> String {
         }
     });
     format!("ws://{addr}")
+}
+
+/// Spawns a server that closes every connection with status 4002 right after the
+/// handshake, and reports the close frames it receives from clients.
+async fn spawn_closing_server() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let log = received.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let log = log.clone();
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let first = ws.next().await;
+                if let Some(Ok(Message::Close(Some(close)))) = first {
+                    // client-initiated close: record it and finish the handshake
+                    log.lock()
+                        .unwrap()
+                        .push(format!("{}:{}", u16::from(close.code), close.reason));
+                    return;
+                }
+                let _ = ws
+                    .close(Some(CloseFrame {
+                        code: CloseCode::from(4002),
+                        reason: "maintenance".into(),
+                    }))
+                    .await;
+                while let Some(Ok(_)) = ws.next().await {}
+            });
+        }
+    });
+    (format!("ws://{addr}"), received)
 }
 
 /// Spawns a plain HTTP server that 302-redirects every request to `target`.
@@ -181,6 +226,45 @@ async fn graceful_disconnect_close_handshake() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(handler.count("connected"), 1);
     assert_eq!(handler.count("disconnected"), 1);
+}
+
+#[actix_rt::test]
+async fn server_close_code_and_reason_are_reported() {
+    let (url, _) = spawn_closing_server().await;
+    let handler = RecordingHandler::default();
+    let client = start_client(&url, handler.clone());
+
+    client.send(Connect).await.unwrap().unwrap();
+    // any message makes the server close the connection with its status
+    client.send(SendText::new("hello")).await.unwrap().unwrap();
+
+    wait_until(
+        || handler.contains("closed-by-server:Some(4002):maintenance"),
+        "server close status",
+    )
+    .await;
+    client.send(Disconnect).await.unwrap();
+}
+
+#[actix_rt::test]
+async fn close_message_delivers_code_and_reason_to_the_server() {
+    let (url, received) = spawn_closing_server().await;
+    let handler = RecordingHandler::default();
+    let client = start_client(&url, handler.clone());
+
+    client.send(Connect).await.unwrap().unwrap();
+    client
+        .send(Close::new(4100, "standby"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    wait_until(
+        || received.lock().unwrap().iter().any(|c| c == "4100:standby"),
+        "close frame at the server",
+    )
+    .await;
+    assert!(!client.send(IsConnected).await.unwrap());
 }
 
 #[actix_rt::test]

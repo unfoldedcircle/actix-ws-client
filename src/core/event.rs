@@ -17,8 +17,17 @@ pub(crate) enum Frame {
     Ping(Bytes),
     /// A pong frame with its application payload.
     Pong(Bytes),
-    /// A close frame.
-    Close,
+    /// A close frame, with the status code and reason if it carries any.
+    Close(Option<CloseInfo>),
+}
+
+/// Status code and reason of a close frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CloseInfo {
+    /// The close status code (RFC 6455 §7.4).
+    pub code: u16,
+    /// The close reason; may be empty.
+    pub reason: String,
 }
 
 /// Everything that can happen in the real world, translated into an input for
@@ -34,6 +43,14 @@ pub(crate) enum Event {
     ConnectRequested,
     /// The user requested a graceful disconnect ([`crate::Disconnect`] message).
     DisconnectRequested,
+    /// The user requested a graceful disconnect with a specific close code and reason
+    /// ([`crate::Close`] message or [`crate::HandlerAction::Close`]).
+    CloseRequested {
+        /// Status code and reason to send in the close frame.
+        close: CloseInfo,
+        /// Reconnect according to the reconnect policy instead of stopping.
+        reconnect: bool,
+    },
     /// The user requested to drop the current connection and establish a new one
     /// ([`crate::Reconnect`] message or [`crate::HandlerAction::Reconnect`]).
     ReconnectRequested,

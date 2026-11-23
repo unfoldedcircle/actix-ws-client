@@ -13,15 +13,18 @@ pub(crate) mod writer;
 
 use crate::config::WebSocketConfig;
 use crate::core::effect::{Callback, Effect};
-use crate::core::event::{Event, Frame};
+use crate::core::event::{CloseInfo, Event, Frame};
 use crate::core::{CoreConfig, Machine};
 use crate::error::Error;
-use crate::handler::{HandlerAction, WebSocketMessageHandler};
-use crate::message::{Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
+use crate::handler::{HandlerAction, TraceDirection, WebSocketMessageHandler};
+use crate::message::{Close, Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
+use crate::tls::TlsContext;
 use actix::fut::{ActorFutureExt, wrap_future};
 use actix::prelude::*;
 use log::{debug, info, trace, warn};
 use reader::ReaderEvent;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -30,6 +33,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig as WsProtocolConfig;
 use transport::{
     BoxSink, BoxStream, ConnectOptions, Transport, TungsteniteTransport, message_from_frame,
+    validate_close,
 };
 use writer::WriteItem;
 
@@ -80,6 +84,8 @@ where
     // Per-connection resources, created and destroyed by effects. The active
     // connection generation is tracked by the machine.
     writer_tx: Option<mpsc::UnboundedSender<WriteItem>>,
+    // Number of messages waiting in the writer queue of the current connection.
+    send_queue_len: Arc<AtomicUsize>,
     reader_handle: Option<SpawnHandle>,
     connect_handle: Option<SpawnHandle>,
     keepalive_handle: Option<SpawnHandle>,
@@ -93,6 +99,8 @@ where
     pending_connect: Option<oneshot::Sender<Result<(), Error>>>,
     // Optional per-attempt URL refresh hook.
     url_provider: Option<UrlProvider>,
+    // TLS settings shared by all connection attempts.
+    tls: TlsContext,
     // Timestamp of the last traced outbound message (msg_tracing_out).
     last_msg_send_time: Option<Instant>,
 }
@@ -135,10 +143,12 @@ where
                 .map_err(|e| Error::InvalidRequest(e.to_string()))?,
             id: id.into(),
             machine: Machine::new(CoreConfig::from(&config)),
+            tls: TlsContext::new(&config),
             config,
             handler,
             transport,
             writer_tx: None,
+            send_queue_len: Arc::default(),
             reader_handle: None,
             connect_handle: None,
             keepalive_handle: None,
@@ -232,6 +242,23 @@ where
             HandlerAction::Disconnect => {
                 self.dispatch(Event::DisconnectRequested, ctx);
             }
+            HandlerAction::Close {
+                code,
+                reason,
+                reconnect,
+            } => {
+                let close = match validate_close(code, &reason) {
+                    Ok(()) => CloseInfo { code, reason },
+                    Err(error) => {
+                        warn!("[{}] {error}: closing with a normal closure", self.id);
+                        CloseInfo {
+                            code: 1000,
+                            reason: String::new(),
+                        }
+                    }
+                };
+                self.dispatch(Event::CloseRequested { close, reconnect }, ctx);
+            }
             HandlerAction::Reconnect => {
                 self.dispatch(Event::ReconnectRequested, ctx);
             }
@@ -249,6 +276,10 @@ where
             );
             return;
         }
+        if self.send_queue_full() {
+            warn!("[{}] Dropping handler frame: send queue full", self.id);
+            return;
+        }
         self.enqueue_write(WriteItem { msg, tx: None });
     }
 
@@ -261,6 +292,7 @@ where
         };
         if self.config.msg_tracing_out
             && let Message::Text(text) = &item.msg
+            && let Some(text) = self.handler.redact_trace(TraceDirection::Outgoing, text)
         {
             let elapsed = self
                 .last_msg_send_time
@@ -270,7 +302,18 @@ where
             debug!("[{}] {:4} <- {text}", self.id, elapsed.as_millis());
             self.last_msg_send_time = Some(Instant::now());
         }
-        writer_tx.send(item).is_ok()
+        let enqueued = writer_tx.send(item).is_ok();
+        if enqueued {
+            self.send_queue_len.fetch_add(1, Ordering::Relaxed);
+        }
+        enqueued
+    }
+
+    /// Whether the writer queue reached the configured `max_send_queue`.
+    fn send_queue_full(&self) -> bool {
+        self.config
+            .max_send_queue
+            .is_some_and(|max| self.send_queue_len.load(Ordering::Relaxed) >= max)
     }
 
     fn start_connect(&mut self, generation: u64, timeout: Duration, ctx: &mut Context<Self>) {
@@ -304,7 +347,7 @@ where
             timeout,
             max_redirects: self.config.max_redirects,
             ws_config,
-            danger_accept_invalid_certs: self.config.danger_accept_invalid_certs,
+            tls: self.tls.clone(),
         };
         let future = self.transport.connect(self.request.clone(), options);
         let handle = ctx.spawn(
@@ -362,11 +405,13 @@ where
         };
         let (tx, rx) = mpsc::unbounded_channel();
         self.writer_tx = Some(tx);
+        let queued = Arc::new(AtomicUsize::new(0));
+        self.send_queue_len = queued.clone();
         let addr = ctx.address();
         // Detached task (not tied to the actor context): on teardown it must outlive
         // the actor's handler to drain the queue, e.g. flush a final Close frame.
         actix::spawn(async move {
-            if let Some(error) = writer::run_writer(sink, rx).await {
+            if let Some(error) = writer::run_writer(sink, rx, queued).await {
                 addr.do_send(WriteFailedMsg { generation, error });
             }
         });
@@ -450,7 +495,9 @@ where
     fn emit(&mut self, callback: Callback) -> Vec<HandlerAction> {
         match callback {
             Callback::OnText(text) => {
-                if self.config.msg_tracing_in {
+                if self.config.msg_tracing_in
+                    && let Some(text) = self.handler.redact_trace(TraceDirection::Incoming, &text)
+                {
                     debug!("[{}] -> {text}", self.id);
                 }
                 self.handler.on_text(text)
@@ -459,6 +506,11 @@ where
             Callback::OnConnected => {
                 info!("[{}] Connected", self.id);
                 self.handler.on_connected()
+            }
+            Callback::OnClosed(reason) => {
+                debug!("[{}] Connection closed: {reason:?}", self.id);
+                self.handler.on_closed(&reason);
+                Vec::new()
             }
             Callback::OnDisconnected => {
                 info!("[{}] Disconnected", self.id);
@@ -480,10 +532,14 @@ where
 
     /// Common implementation for `SendText` / `SendBinary`: enqueue to the writer
     /// task, never awaiting in the handler. Returns `NotConnected` immediately when
-    /// there is no active connection.
+    /// there is no active connection, and `SendQueueFull` when the queue limit is
+    /// reached.
     fn send_message(&mut self, msg: Message) -> ResponseFuture<Result<(), Error>> {
         if !self.machine.is_connected() {
             return Box::pin(async { Err(Error::NotConnected) });
+        }
+        if self.send_queue_full() {
+            return Box::pin(async { Err(Error::SendQueueFull) });
         }
         let (tx, rx) = oneshot::channel();
         if !self.enqueue_write(WriteItem { msg, tx: Some(tx) }) {
@@ -562,6 +618,29 @@ impl<H: WebSocketMessageHandler> Handler<Disconnect> for GenericWebSocketClient<
     }
 }
 
+impl<H: WebSocketMessageHandler> Handler<Close> for GenericWebSocketClient<H> {
+    type Result = Result<(), Error>;
+
+    fn handle(&mut self, msg: Close, ctx: &mut Context<Self>) -> Self::Result {
+        validate_close(msg.code, &msg.reason)?;
+        debug!(
+            "[{}] Explicit disconnect requested (close code {})",
+            self.id, msg.code
+        );
+        self.dispatch(
+            Event::CloseRequested {
+                close: CloseInfo {
+                    code: msg.code,
+                    reason: msg.reason,
+                },
+                reconnect: msg.reconnect,
+            },
+            ctx,
+        );
+        Ok(())
+    }
+}
+
 impl<H: WebSocketMessageHandler> Handler<Reconnect> for GenericWebSocketClient<H> {
     type Result = ();
 
@@ -625,11 +704,13 @@ impl<H: WebSocketMessageHandler> Handler<WriteFailedMsg> for GenericWebSocketCli
 
 #[cfg(test)]
 mod tests {
-    use super::testutil::{MockTransport, mock_sink, scripted_stream};
+    use super::testutil::{MockTransport, blocked_sink, mock_sink, scripted_stream};
     use super::*;
-    use crate::WebSocketConfig;
+    use crate::{DisconnectReason, WebSocketConfig};
     use bytes::Bytes;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
+    use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
     #[derive(Clone, Default)]
     struct TestHandler {
@@ -679,6 +760,9 @@ mod tests {
             self.log.lock().unwrap().push("connected".into());
             std::mem::take(&mut *self.connected_actions.lock().unwrap())
         }
+        fn on_closed(&mut self, reason: &DisconnectReason) {
+            self.log.lock().unwrap().push(format!("closed:{reason:?}"));
+        }
         fn on_disconnected(&mut self) {
             self.log.lock().unwrap().push("disconnected".into());
         }
@@ -687,6 +771,17 @@ mod tests {
         }
         fn on_reconnect_exhausted(&mut self) {
             self.log.lock().unwrap().push("exhausted".into());
+        }
+        fn redact_trace<'a>(
+            &self,
+            direction: TraceDirection,
+            text: &'a str,
+        ) -> Option<std::borrow::Cow<'a, str>> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("trace:{direction:?}:{text}"));
+            None
         }
     }
 
@@ -749,6 +844,101 @@ mod tests {
             .unbounded_send(Ok(Message::Text("world".into())))
             .unwrap();
         wait_until(|| handler.log_contains("text:world"), "inbound text").await;
+    }
+
+    #[actix_rt::test]
+    async fn traced_messages_pass_the_redaction_hook() {
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let config = WebSocketConfig::builder()
+            .msg_tracing_in(true)
+            .msg_tracing_out(true)
+            .build()
+            .unwrap();
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            "ws://localhost",
+            config,
+            handler.clone(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .start();
+        addr.send(Connect).await.unwrap().unwrap();
+
+        addr.send(SendText::new("secret")).await.unwrap().unwrap();
+        script
+            .unbounded_send(Ok(Message::Text("reply".into())))
+            .unwrap();
+        wait_until(|| handler.log_contains("text:reply"), "inbound text").await;
+
+        assert!(handler.log_contains("trace:Outgoing:secret"));
+        assert!(handler.log_contains("trace:Incoming:reply"));
+        // The hook only affects the log: the message itself is sent unchanged.
+        assert!(sent_contains(
+            &sent,
+            |m| matches!(m, Message::Text(t) if t.as_str() == "secret")
+        ));
+    }
+
+    #[actix_rt::test]
+    async fn redaction_hook_is_not_called_without_message_tracing() {
+        let (sink, _sent) = mock_sink(usize::MAX);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        addr.send(SendText::new("hello")).await.unwrap().unwrap();
+        script
+            .unbounded_send(Ok(Message::Text("world".into())))
+            .unwrap();
+        wait_until(|| handler.log_contains("text:world"), "inbound text").await;
+
+        assert!(
+            !handler
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("trace:"))
+        );
+    }
+
+    #[actix_rt::test]
+    async fn full_send_queue_rejects_further_messages() {
+        let (_script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((blocked_sink(), stream))]);
+        let config = WebSocketConfig::builder()
+            .max_send_queue(2usize)
+            .build()
+            .unwrap();
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            "ws://localhost",
+            config,
+            TestHandler::default(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .start();
+        addr.send(Connect).await.unwrap().unwrap();
+
+        // The first message is taken by the writer, which then blocks on the socket.
+        addr.do_send(SendText::new("in flight"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Two more messages fill the queue.
+        addr.do_send(SendText::new("queued 1"));
+        addr.do_send(SendText::new("queued 2"));
+
+        let result = addr.send(SendText::new("too many")).await.unwrap();
+
+        assert_eq!(result, Err(Error::SendQueueFull));
+        // A full queue is not a connection failure.
+        assert!(addr.send(IsConnected).await.unwrap());
     }
 
     #[actix_rt::test]
@@ -852,6 +1042,166 @@ mod tests {
         .await;
         assert!(!addr.send(IsConnected).await.unwrap());
         assert_eq!(handler.count("disconnected"), 1);
+    }
+
+    fn sent_close(sent: &Arc<Mutex<Vec<Message>>>, code: u16, reason: &str) -> bool {
+        sent_contains(sent, |m| {
+            matches!(m, Message::Close(Some(close))
+                if u16::from(close.code) == code && close.reason.as_str() == reason)
+        })
+    }
+
+    #[actix_rt::test]
+    async fn close_message_sends_code_and_reason_without_reconnect() {
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, attempts) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        addr.send(Close::new(4000, "going to standby"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        wait_until(
+            || sent_close(&sent, 4000, "going to standby"),
+            "close frame written",
+        )
+        .await;
+        assert!(handler.log_contains("closed:ClosedLocally"));
+        assert_eq!(handler.count("disconnected"), 1);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+    }
+
+    #[actix_rt::test]
+    async fn close_message_rejects_invalid_code_and_long_reason() {
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let addr = client(transport, TestHandler::default());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        // 1006 (abnormal closure) must never be sent in a close frame
+        let result = addr.send(Close::new(1006, "")).await.unwrap();
+        assert!(matches!(result, Err(Error::InvalidRequest(_))));
+        let result = addr.send(Close::new(1000, "x".repeat(124))).await.unwrap();
+        assert!(matches!(result, Err(Error::InvalidRequest(_))));
+
+        // the connection is left untouched
+        assert!(addr.send(IsConnected).await.unwrap());
+        assert!(!sent_contains(&sent, |m| matches!(m, Message::Close(_))));
+    }
+
+    #[actix_rt::test]
+    async fn close_action_sends_code_and_reason() {
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        handler.set_text_actions(vec![HandlerAction::Close {
+            code: 1003,
+            reason: "binary not supported".into(),
+            reconnect: false,
+        }]);
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        script
+            .unbounded_send(Ok(Message::Text("trigger".into())))
+            .unwrap();
+
+        wait_until(
+            || sent_close(&sent, 1003, "binary not supported"),
+            "close frame written",
+        )
+        .await;
+        assert!(!addr.send(IsConnected).await.unwrap());
+    }
+
+    #[actix_rt::test]
+    async fn close_with_reconnect_establishes_a_new_connection_after_the_backoff() {
+        let (sink1, sent1) = mock_sink(usize::MAX);
+        let (_script1, stream1) = scripted_stream();
+        let (sink2, _sent2) = mock_sink(usize::MAX);
+        let (_script2, stream2) = scripted_stream();
+        let (transport, attempts) =
+            MockTransport::scripted(vec![Ok((sink1, stream1)), Ok((sink2, stream2))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        addr.send(Close::new(1002, "unexpected message").with_reconnect())
+            .await
+            .unwrap()
+            .unwrap();
+
+        wait_until(
+            || sent_close(&sent1, 1002, "unexpected message"),
+            "close frame written",
+        )
+        .await;
+        // not immediately: the reconnect waits for the backoff delay
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+        wait_until(|| handler.count("connected") == 2, "reconnected").await;
+        assert_eq!(handler.count("disconnected"), 1);
+    }
+
+    #[actix_rt::test]
+    async fn invalid_close_action_falls_back_to_a_normal_closure() {
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        handler.set_text_actions(vec![HandlerAction::Close {
+            code: 1005,
+            reason: String::new(),
+            reconnect: false,
+        }]);
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        script
+            .unbounded_send(Ok(Message::Text("trigger".into())))
+            .unwrap();
+
+        wait_until(|| sent_close(&sent, 1000, ""), "close frame written").await;
+        assert!(!addr.send(IsConnected).await.unwrap());
+    }
+
+    #[actix_rt::test]
+    async fn server_close_code_is_reported_before_disconnected() {
+        let (sink, _sent) = mock_sink(usize::MAX);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        script
+            .unbounded_send(Ok(Message::Close(Some(CloseFrame {
+                code: CloseCode::from(4001),
+                reason: "session expired".into(),
+            }))))
+            .unwrap();
+
+        wait_until(|| handler.count("disconnected") == 1, "disconnected").await;
+        let log = handler.log.lock().unwrap();
+        let closed = log
+            .iter()
+            .position(|e| {
+                e == &format!(
+                    "closed:{:?}",
+                    DisconnectReason::ClosedByServer {
+                        code: Some(4001),
+                        reason: "session expired".into()
+                    }
+                )
+            })
+            .expect("close reason reported");
+        assert_eq!(log[closed + 1], "disconnected");
     }
 
     #[actix_rt::test]
@@ -1172,6 +1522,7 @@ mod tests {
         assert_eq!(attempts[0].options.ws_config.max_frame_size, Some(65_536));
     }
 
+    #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
     #[actix_rt::test]
     async fn danger_accept_invalid_certs_is_passed_to_the_transport() {
         let (sink, _sent) = mock_sink(usize::MAX);
@@ -1194,7 +1545,9 @@ mod tests {
         addr.send(Connect).await.unwrap().unwrap();
 
         let attempts = attempts.lock().unwrap();
-        assert!(attempts[0].options.danger_accept_invalid_certs);
+        // A dedicated connector without verification replaces the transport default.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        assert!(attempts[0].options.tls.connector().unwrap().is_some());
     }
 
     #[actix_rt::test]
@@ -1217,6 +1570,8 @@ mod tests {
             defaults.max_frame_size
         );
         // TLS verification is on by default
-        assert!(!attempts[0].options.danger_accept_invalid_certs);
+        // native-tls: the transport's default connector (system roots, full verification).
+        #[cfg(feature = "native-tls")]
+        assert!(attempts[0].options.tls.connector().unwrap().is_none());
     }
 }

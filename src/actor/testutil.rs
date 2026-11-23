@@ -52,6 +52,34 @@ pub(crate) fn mock_sink(fail_after: usize) -> (BoxSink, Arc<Mutex<Vec<Message>>>
     (Box::pin(sink), sent)
 }
 
+/// Sink that never becomes ready: every write blocks forever (stalled socket).
+struct BlockedSink;
+
+impl futures::Sink<Message> for BlockedSink {
+    type Error = WsError;
+
+    fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+        Poll::Pending
+    }
+
+    fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+        Poll::Pending
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Creates a sink that never accepts a message.
+pub(crate) fn blocked_sink() -> BoxSink {
+    Box::pin(BlockedSink)
+}
+
 /// In-memory stream: push items via the sender; drop the sender to end the stream.
 pub(crate) type StreamScript = futures::channel::mpsc::UnboundedSender<Result<Message, WsError>>;
 
