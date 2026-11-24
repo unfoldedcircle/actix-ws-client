@@ -270,6 +270,13 @@ cargo test --no-default-features --features rustls-platform-verifier      # rust
 cargo test --no-default-features                                          # no TLS
 ```
 
+## Versioning
+
+We use [SemVer](http://semver.org/) for versioning. For the versions available, see the
+[tags on this repository](https://github.com/unfoldedcircle/actix-ws-client/tags).
+
+The major changes found in each new release are listed in the [changelog](./CHANGELOG.md).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
