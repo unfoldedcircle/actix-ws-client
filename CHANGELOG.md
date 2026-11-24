@@ -11,6 +11,7 @@ _Changes in the next release_
 
 ### Added
 - git-tag.py script for creating annotated git tag releases.
+- Dependabot for Cargo and GitHub Actions.
 
 ---
 
