@@ -3,6 +3,7 @@ name = "actix-ws-client"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
+authors = ["Markus Zehnder <markus.z@unfoldedcircle.com>"]
 license = "MIT OR Apache-2.0"
 description = "Actor-based WebSocket client for Actix with automatic reconnection and ping/pong keep-alive"
 repository = "https://github.com/unfoldedcircle/actix-ws-client"
@@ -28,15 +29,14 @@ native-tls = { version = "0.2", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
 rustls-platform-verifier = { version = "0.7", optional = true }
 futures = "0.3"
-bytes = "1.7"
-log = "0.4.22"
+bytes = "1"
+log = "0.4"
 derive_builder = "0.20"
 fastrand = "2"
 
 [dev-dependencies]
 actix-rt = "2.10"
 env_logger = "0.11"
-rstest = "0.26.1"
 tokio = { version = "1.42", features = ["macros", "rt", "sync", "time", "test-util", "net", "io-util"] }
 # TLS end-to-end tests: self-signed certificate and a local `wss://` server.
 rcgen = "0.14"
