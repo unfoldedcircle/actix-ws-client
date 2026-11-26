@@ -14,6 +14,7 @@ _Changes in the next release_
 - Dependabot for Cargo and GitHub Actions.
 - `close_timeout` option: how long a closing connection waits for the server. Default is 5 seconds.
 - `Stop` message: closes the connection and stops the actor.
+- `tcp_nodelay` option, enabled by default.
 
 ### Changed
 - A connection is closed with a complete close handshake: after the close frame the client keeps reading until the
@@ -30,7 +31,15 @@ _Changes in the next release_
 - `Reconnect` during a connection attempt cancels the attempt and starts a new one with a fresh attempt counter. Before,
   it was ignored.
 
+- `TCP_NODELAY` is set on the connection by default. Before, a small message could be delayed until the previous one
+  was acknowledged.
+- The addresses of a host name are raced when connecting (RFC 8305) instead of being tried one after another.
+
 ### Fixed
+- A host name with an address that does not answer, typically IPv6 without a route, no longer uses up the whole
+  connect timeout: the next address is tried after 250 ms.
+- Every connection attempt uses a new `Sec-WebSocket-Key`. Before, the key of the first attempt was reused.
+- An IPv6 address in the URL (`ws://[::1]:8080`) is connected correctly with the rustls backend.
 - A stalled socket is dropped when its connection ends. Before, the connection stayed open and pending `SendText` /
   `SendBinary` requests never resolved, also after a keep-alive timeout.
 - A disconnected client with a stalled socket stops when all of its addresses are dropped.
