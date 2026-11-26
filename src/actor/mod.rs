@@ -1612,6 +1612,65 @@ mod tests {
         assert!(attempts.lock().unwrap().is_empty());
     }
 
+    /// Creates a client for `url` without starting it.
+    fn new_client(url: &str) -> Result<GenericWebSocketClient<TestHandler>, Error> {
+        GenericWebSocketClient::new("test", url, config(), TestHandler::default())
+    }
+
+    #[test]
+    fn new_rejects_a_url_that_is_not_a_websocket_url() {
+        for url in [
+            "http://example.com/ws",
+            "https://example.com/ws",
+            "ftp://example.com",
+        ] {
+            assert!(
+                matches!(new_client(url), Err(Error::InvalidRequest(_))),
+                "{url} can never be connected"
+            );
+        }
+        assert!(new_client("ws://example.com/ws").is_ok());
+    }
+
+    #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
+    #[test]
+    fn new_accepts_wss_with_a_tls_backend() {
+        assert!(new_client("wss://example.com/ws").is_ok());
+    }
+
+    #[cfg(not(any(feature = "native-tls", feature = "rustls-platform-verifier")))]
+    #[test]
+    fn new_rejects_wss_without_a_tls_backend() {
+        assert!(
+            matches!(
+                new_client("wss://example.com/ws"),
+                Err(Error::InvalidRequest(_))
+            ),
+            "wss:// can never be connected without a TLS backend"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn provider_url_that_is_not_a_websocket_url_fails_the_attempt() {
+        let (transport, attempts) = MockTransport::scripted(vec![]);
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            "ws://localhost",
+            config(),
+            TestHandler::default(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .with_url_provider(|| Some("http://localhost".into()))
+        .start();
+
+        let result = addr.send(Connect).await.unwrap();
+        assert!(matches!(result, Err(Error::InvalidRequest(_))));
+        // the transport was never called with the unusable request
+        assert!(attempts.lock().unwrap().is_empty());
+        addr.do_send(Disconnect);
+    }
+
     // ========================================================================
     // Frame/message size limits (§5.1)
     // ========================================================================
