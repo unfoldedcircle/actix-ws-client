@@ -81,6 +81,38 @@ impl Transport for TungsteniteTransport {
     }
 }
 
+/// Checks that a request can be connected at all: a URL that never can would fail
+/// every attempt and be retried forever.
+///
+/// The scheme must be `ws` or `wss` — `wss` only with a TLS backend — and the URL
+/// needs a host.
+pub(crate) fn validate_request(request: &WsRequest) -> Result<(), Error> {
+    let uri = request.uri();
+    match uri.scheme_str() {
+        Some("ws") => {}
+        #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
+        Some("wss") => {}
+        #[cfg(not(any(feature = "native-tls", feature = "rustls-platform-verifier")))]
+        Some("wss") => {
+            return Err(Error::InvalidRequest(
+                "wss:// needs a TLS backend: enable the `native-tls` or \
+                 `rustls-platform-verifier` feature"
+                    .into(),
+            ));
+        }
+        scheme => {
+            return Err(Error::InvalidRequest(format!(
+                "URL scheme must be ws or wss, not {}",
+                scheme.unwrap_or("empty")
+            )));
+        }
+    }
+    if uri.host().is_none_or(str::is_empty) {
+        return Err(Error::InvalidRequest("URL has no host".into()));
+    }
+    Ok(())
+}
+
 /// Attempts to establish a websocket connection, following HTTP redirects up to
 /// `options.max_redirects`.
 async fn connect_follow_redirects(
@@ -440,6 +472,25 @@ mod tests {
             target(&request("http://example.com/x")),
             Err(WsError::Url(UrlError::UnsupportedUrlScheme))
         ));
+    }
+
+    #[test]
+    fn request_needs_a_websocket_scheme() {
+        assert!(validate_request(&request("ws://example.com/x")).is_ok());
+        assert!(validate_request(&request("ws://[::1]:8080")).is_ok());
+        for url in [
+            "http://example.com",
+            "https://example.com",
+            "WS://example.com",
+        ] {
+            assert!(
+                matches!(
+                    validate_request(&request(url)),
+                    Err(Error::InvalidRequest(_))
+                ),
+                "{url}"
+            );
+        }
     }
 
     #[test]

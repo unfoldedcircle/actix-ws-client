@@ -38,7 +38,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig as WsProtocolConfig;
 use transport::{
     BoxSink, BoxStream, ConnectOptions, Transport, TungsteniteTransport, copy_headers,
-    message_from_frame, validate_close,
+    message_from_frame, validate_close, validate_request,
 };
 use writer::WriteItem;
 
@@ -146,6 +146,12 @@ where
     /// * `request` - The WebSocket URL or request to connect to.
     /// * `config` - Connection, reconnection and keep-alive configuration.
     /// * `handler` - An implementation of [`WebSocketMessageHandler`] to handle received messages.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::InvalidRequest`] if the request cannot be connected: it is
+    /// not a valid request, its URL scheme is not `ws` or `wss`, it has no host, or it
+    /// is a `wss` URL and the crate is built without a TLS backend.
     pub fn new<R, S>(id: S, request: R, config: WebSocketConfig, handler: H) -> Result<Self, Error>
     where
         R: IntoClientRequest + Unpin,
@@ -166,10 +172,12 @@ where
         R: IntoClientRequest + Unpin,
         S: Into<String>,
     {
+        let request = request
+            .into_client_request()
+            .map_err(|e| Error::InvalidRequest(e.to_string()))?;
+        validate_request(&request)?;
         Ok(Self {
-            request: request
-                .into_client_request()
-                .map_err(|e| Error::InvalidRequest(e.to_string()))?,
+            request,
             id: id.into(),
             machine: Machine::new(CoreConfig::from(&config)),
             tls: TlsContext::new(&config),
@@ -403,6 +411,7 @@ where
             .as_str()
             .into_client_request()
             .map_err(|e| Error::InvalidRequest(format!("provider URL {url:?}: {e}")))?;
+        validate_request(&new_request)?;
         copy_headers(&self.request, &mut new_request, |_| true);
         if new_request.uri() != self.request.uri() {
             debug!("[{}] Using refreshed URL: {url}", self.id);
