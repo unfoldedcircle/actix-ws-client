@@ -43,8 +43,9 @@ impl WebSocketMessageHandler for EchoHandler {
         println!("Disconnected.");
     }
 
-    fn on_error(&mut self, error: &Error) {
+    fn on_error(&mut self, error: &Error) -> Vec<HandlerAction> {
         eprintln!("Error: {error}");
+        Vec::new()
     }
 }
 

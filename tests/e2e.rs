@@ -56,19 +56,21 @@ impl WebSocketMessageHandler for RecordingHandler {
         self.log.lock().unwrap().push("connected".into());
         Vec::new()
     }
-    fn on_closed(&mut self, reason: &DisconnectReason) {
+    fn on_closed(&mut self, reason: &DisconnectReason) -> Vec<HandlerAction> {
         if let DisconnectReason::ClosedByServer { code, reason } = reason {
             self.log
                 .lock()
                 .unwrap()
                 .push(format!("closed-by-server:{code:?}:{reason}"));
         }
+        Vec::new()
     }
     fn on_disconnected(&mut self) {
         self.log.lock().unwrap().push("disconnected".into());
     }
-    fn on_error(&mut self, error: &Error) {
+    fn on_error(&mut self, error: &Error) -> Vec<HandlerAction> {
         self.log.lock().unwrap().push(format!("error:{error}"));
+        Vec::new()
     }
 }
 

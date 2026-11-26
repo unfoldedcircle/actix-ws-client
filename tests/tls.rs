@@ -33,8 +33,9 @@ impl WebSocketMessageHandler for RecordingHandler {
         self.texts.lock().unwrap().push(text);
         Vec::new()
     }
-    fn on_error(&mut self, error: &Error) {
+    fn on_error(&mut self, error: &Error) -> Vec<HandlerAction> {
         self.errors.lock().unwrap().push(error.clone());
+        Vec::new()
     }
 }
 

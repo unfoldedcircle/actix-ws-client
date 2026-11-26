@@ -54,11 +54,13 @@ TLS options of `WebSocketConfig`, working with both backends:
   again at once with a fresh attempt counter), `Stop` (close, stop the actor),
   `SendText`, `SendBinary`, `IsConnected`.
 - `WebSocketMessageHandler` — callback trait (`on_text`, `on_binary`, `on_connected`,
-  `on_closed`, `on_disconnected`, `on_error`, `on_reconnect_exhausted`, `redact_trace`). `on_text` / `on_binary` /
-  `on_connected` return a `Vec<HandlerAction>` executed by the client right after the
+  `on_closed`, `on_disconnected`, `on_error`, `on_reconnect_exhausted`, `redact_trace`).
+  All callbacks except `on_disconnected` and `redact_trace` return a
+  `Vec<HandlerAction>` executed by the client right after the
   callback: `SendText`, `SendBinary`, `Disconnect` / `Close { code, reason, reconnect }`
   (terminal, or reconnect per policy) or `Reconnect` (fresh connection). This lets a handler implement request/reply protocols (e.g. an
-  authentication handshake) or disconnect on fatal messages without holding a client
+  authentication handshake), disconnect on fatal messages, or stop reconnecting after
+  a fatal error (`Disconnect` from `on_error` / `on_closed`) without holding a client
   address — the handler stays a pure, unit-testable function of its input. Send
   actions returned while the connection is no longer up are dropped with a warning.
 - `WebSocketConfig` + builder, `Certificate`, `TlsConnector`.
@@ -298,8 +300,29 @@ directly before `on_disconnected`:
 
 The reconnect policy does not depend on the reason: after a server close the client
 reconnects as before. A consumer that must not reconnect after a specific status
-(e.g. an application code for "access revoked") sends `Disconnect` from its
-`on_closed` handling.
+(e.g. an application code for "access revoked") returns `HandlerAction::Disconnect`
+from `on_closed`, which cancels the reconnect that is already scheduled.
+
+## Errors that will not go away
+
+The client retries after every failure, whatever its cause: a refused connection, a
+timeout, but also an HTTP 401 or a rejected certificate. It cannot know which errors
+are permanent for an application. The handler decides: `on_error` gets the error of
+every failed connection attempt and of a lost connection, and returns
+`HandlerAction::Disconnect` to stop.
+
+```rust
+fn on_error(&mut self, error: &Error) -> Vec<HandlerAction> {
+    match error {
+        // Rejected credentials or certificate: retrying is pointless.
+        Error::Http { status: 401 | 403 } | Error::Tls(_) => vec![HandlerAction::Disconnect],
+        _ => Vec::new(),
+    }
+}
+```
+
+After the attempt cap is reached, `on_reconnect_exhausted` can start a new sequence
+with `HandlerAction::Reconnect`.
 
 ## Configuration
 

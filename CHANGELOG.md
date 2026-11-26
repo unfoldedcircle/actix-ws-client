@@ -17,6 +17,9 @@ _Changes in the next release_
 - `tcp_nodelay` option, enabled by default.
 
 ### Changed
+- **Breaking:** `on_closed`, `on_error` and `on_reconnect_exhausted` of `WebSocketMessageHandler` return a
+  `Vec<HandlerAction>`, like `on_text`. Return `Vec::new()` to keep the former behaviour. A handler can now stop
+  reconnecting after a fatal error or close status with `HandlerAction::Disconnect`, without an address of its client.
 - A connection is closed with a complete close handshake: after the close frame the client keeps reading until the
   server closed the connection, limited by `close_timeout`. This happens in the background, the client is
   disconnected right away.
