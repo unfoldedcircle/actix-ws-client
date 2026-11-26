@@ -704,11 +704,14 @@ impl<H: WebSocketMessageHandler> Handler<WriteFailedMsg> for GenericWebSocketCli
 
 #[cfg(test)]
 mod tests {
-    use super::testutil::{MockTransport, blocked_sink, mock_sink, scripted_stream};
+    use super::testutil::{
+        MockTransport, blocked_sink, mock_sink, scripted_stream, track_sink, track_stream,
+    };
     use super::*;
     use crate::{DisconnectReason, WebSocketConfig};
     use bytes::Bytes;
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering::SeqCst;
     use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
@@ -1573,5 +1576,174 @@ mod tests {
         // native-tls: the transport's default connector (system roots, full verification).
         #[cfg(feature = "native-tls")]
         assert!(attempts[0].options.tls.connector().unwrap().is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Connection teardown
+    //
+    // These tests run with a paused clock: timeouts elapse without waiting, and a
+    // future that never resolves fails the test instead of hanging it.
+    // ------------------------------------------------------------------
+
+    fn is_close(msg: &Message) -> bool {
+        matches!(msg, Message::Close(_))
+    }
+
+    #[actix_rt::test]
+    async fn disconnect_with_a_stalled_writer_fails_pending_sends_and_drops_the_connection() {
+        tokio::time::pause();
+        let (sink, sink_dropped) = track_sink(blocked_sink());
+        let (_script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let addr = client(transport, TestHandler::default());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        // The socket does not take any data: one message is stuck in the writer, one
+        // waits in the queue.
+        let in_flight = addr.send(SendText::new("in flight"));
+        let queued = addr.send(SendText::new("queued"));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        addr.do_send(Disconnect);
+
+        let in_flight = tokio::time::timeout(Duration::from_secs(60), in_flight)
+            .await
+            .expect("the in-flight send must not hang after a disconnect");
+        let queued = tokio::time::timeout(Duration::from_secs(60), queued)
+            .await
+            .expect("the queued send must not hang after a disconnect");
+        assert_eq!(in_flight.unwrap(), Err(Error::NotConnected));
+        assert_eq!(queued.unwrap(), Err(Error::NotConnected));
+        assert!(
+            sink_dropped.load(SeqCst),
+            "the stalled connection must be dropped"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn keep_alive_timeout_aborts_a_stalled_writer() {
+        tokio::time::pause();
+        let (sink1, sink1_dropped) = track_sink(blocked_sink());
+        let (_script1, stream1) = scripted_stream();
+        let (sink2, _sent2) = mock_sink(usize::MAX);
+        let (_script2, stream2) = scripted_stream();
+        let (transport, _) =
+            MockTransport::scripted(vec![Ok((sink1, stream1)), Ok((sink2, stream2))]);
+        let handler = TestHandler::default();
+        let config = WebSocketConfig::builder()
+            .ping_interval(Duration::from_secs(1))
+            .max_missed_pongs(1u32)
+            .initial_backoff(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            "ws://localhost",
+            config,
+            handler.clone(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .start();
+        addr.send(Connect).await.unwrap().unwrap();
+        let pending = addr.send(SendText::new("stuck"));
+
+        // The silent server is dropped after 2 s; the client reconnects.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(handler.log_contains("closed:KeepAliveTimeout"));
+        assert_eq!(handler.count("connected"), 2);
+
+        let pending = tokio::time::timeout(Duration::from_millis(100), pending)
+            .await
+            .expect("a send on the dropped connection must not hang");
+        assert_eq!(pending.unwrap(), Err(Error::NotConnected));
+        assert!(
+            sink1_dropped.load(SeqCst),
+            "the dead connection must be dropped"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn local_close_keeps_the_connection_until_the_server_closes() {
+        tokio::time::pause();
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (sink, sink_dropped) = track_sink(sink);
+        let (script, stream) = scripted_stream();
+        let (stream, stream_dropped) = track_stream(stream);
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let addr = client(transport, TestHandler::default());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        addr.do_send(Disconnect);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The close frame is out, the reply of the server is not in yet.
+        assert!(sent_contains(&sent, is_close));
+        assert!(
+            !stream_dropped.load(SeqCst),
+            "the client must keep reading until the server closed"
+        );
+
+        // The server answers the close frame and closes the connection.
+        script.unbounded_send(Ok(Message::Close(None))).unwrap();
+        drop(script);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(stream_dropped.load(SeqCst));
+        assert!(sink_dropped.load(SeqCst));
+    }
+
+    #[actix_rt::test]
+    async fn disconnect_resolves_when_the_connection_is_closed() {
+        tokio::time::pause();
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (sink, sink_dropped) = track_sink(sink);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let addr = client(transport, TestHandler::default());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        let disconnect = addr.send(Disconnect);
+        tokio::pin!(disconnect);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut disconnect)
+                .await
+                .is_err(),
+            "Disconnect must not resolve before the server closed"
+        );
+        assert!(sent_contains(&sent, is_close));
+        // The client is disconnected right away, only the socket lingers.
+        assert!(!addr.send(IsConnected).await.unwrap());
+
+        script.unbounded_send(Ok(Message::Close(None))).unwrap();
+        drop(script);
+        tokio::time::timeout(Duration::from_secs(1), disconnect)
+            .await
+            .expect("Disconnect must resolve once the server closed")
+            .unwrap();
+        assert!(sink_dropped.load(SeqCst));
+    }
+
+    #[actix_rt::test]
+    async fn disconnected_client_stops_when_dropped_despite_a_stalled_writer() {
+        tokio::time::pause();
+        let (_script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((blocked_sink(), stream))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+        addr.do_send(SendText::new("stuck"));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        addr.do_send(Disconnect);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(addr);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        // The actor owns the second reference to the handler's log.
+        assert_eq!(
+            Arc::strong_count(&handler.log),
+            1,
+            "the actor must stop: nothing may keep it alive"
+        );
     }
 }
