@@ -94,5 +94,9 @@ pub(crate) enum Event {
         generation: u64,
     },
     /// The reconnect timer fired.
-    ReconnectTimerFired,
+    ReconnectTimerFired {
+        /// Generation the timer was armed for, see
+        /// [`crate::core::effect::Effect::ArmReconnectTimer`].
+        generation: u64,
+    },
 }

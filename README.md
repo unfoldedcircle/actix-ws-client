@@ -129,12 +129,12 @@ while the machine is `Disconnected` — or already connecting again — right aw
 
 `ConnectRequested`, `DisconnectRequested`, `ConnectSucceeded{gen}`,
 `ConnectFailed{gen, error}`, `FrameReceived{gen, frame}`, `StreamEnded{gen, error}`,
-`WriteFailed{gen, error}`, `KeepAliveTick{gen}`, `ReconnectTimerFired`.
+`WriteFailed{gen, error}`, `KeepAliveTick{gen}`, `ReconnectTimerFired{gen}`.
 
 ### Effects (outputs)
 
 `StartConnect{gen, timeout}`, `StartConnectionTask{gen}`,
-`SendFrame{frame}`, `TearDownConnection{gen, mode}`, `ArmReconnectTimer{delay}`,
+`SendFrame{frame}`, `TearDownConnection{gen, mode}`, `ArmReconnectTimer{gen, delay}`,
 `StartKeepAlive{gen, interval}`, `StopKeepAlive`, `Emit(callback)`,
 `CompleteConnect{result}`.
 
