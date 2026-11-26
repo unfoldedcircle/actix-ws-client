@@ -241,3 +241,33 @@ impl Transport for MockTransport {
         })
     }
 }
+
+/// Everything the crate logged since the first call, at every level.
+///
+/// The logger is installed for the whole test process on first use, so the records
+/// of tests that run in parallel are mixed: search them for texts that are unique to
+/// a test.
+pub(crate) fn captured_logs() -> Vec<String> {
+    struct Capture(Mutex<Vec<String>>);
+
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            let line = format!("{} {}", record.level(), record.args());
+            self.0.lock().unwrap().push(line);
+        }
+
+        fn flush(&self) {}
+    }
+
+    static CAPTURE: Capture = Capture(Mutex::new(Vec::new()));
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        log::set_logger(&CAPTURE).expect("no other logger in unit tests");
+        log::set_max_level(log::LevelFilter::Trace);
+    });
+    CAPTURE.0.lock().unwrap().clone()
+}

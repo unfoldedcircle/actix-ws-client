@@ -645,6 +645,16 @@ mod tests {
     }
 
     #[test]
+    fn redirect_error_does_not_contain_url_secrets() {
+        let req = request("ws://example.com/socket");
+
+        let error = build_redirect_request(&req, "relative/path?token=token-4713").unwrap_err();
+
+        assert!(!error.to_string().contains("token-4713"), "{error}");
+        assert!(error.to_string().contains("relative/path"), "{error}");
+    }
+
+    #[test]
     fn frame_message_roundtrip() {
         assert_eq!(
             frame_from_message(message_from_frame(Frame::Text("hi".into()))),
