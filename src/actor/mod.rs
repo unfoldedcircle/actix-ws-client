@@ -123,8 +123,8 @@ where
     // Transport halves stashed between connect completion and the
     // StartConnectionTask effect consuming them.
     pending_transport: Option<(BoxSink, BoxStream)>,
-    // Reply channel of an in-flight `Connect` request.
-    pending_connect: Option<oneshot::Sender<Result<(), Error>>>,
+    // Reply channels of the `Connect` requests waiting for the running attempt.
+    pending_connects: Vec<oneshot::Sender<Result<(), Error>>>,
     // Optional per-attempt URL refresh hook.
     url_provider: Option<UrlProvider>,
     // TLS settings shared by all connection attempts.
@@ -181,7 +181,7 @@ where
             reconnect_handle: None,
             closing: Vec::new(),
             pending_transport: None,
-            pending_connect: None,
+            pending_connects: Vec::new(),
             url_provider: None,
             last_msg_send_time: None,
         })
@@ -209,12 +209,8 @@ where
     // ========================================================================
 
     /// Feeds an event into the core and executes the returned effects.
-    ///
-    /// Returns `true` if a connection attempt was started (used by the `Connect`
-    /// handler to distinguish accepted from rejected requests).
-    fn dispatch(&mut self, event: Event, ctx: &mut Context<Self>) -> bool {
+    fn dispatch(&mut self, event: Event, ctx: &mut Context<Self>) {
         let effects = self.machine.on_event(event, Instant::now());
-        let mut started_connect = false;
         // Handler actions are collected during effect execution and run after the
         // whole batch, so an action cannot re-enter the machine while the current
         // effect list is still being executed.
@@ -225,10 +221,7 @@ where
                 Effect::StartConnect {
                     generation,
                     timeout,
-                } => {
-                    started_connect = true;
-                    self.start_connect(generation, timeout, ctx);
-                }
+                } => self.start_connect(generation, timeout, ctx),
                 Effect::StartConnectionTask { generation } => {
                     self.start_connection(generation, ctx)
                 }
@@ -244,8 +237,8 @@ where
                 Effect::StopKeepAlive => self.stop_keepalive(ctx),
                 Effect::Emit(callback) => pending_actions.extend(self.emit(callback)),
                 Effect::CompleteConnect { result } => {
-                    if let Some(tx) = self.pending_connect.take() {
-                        let _ = tx.send(result);
+                    for tx in self.pending_connects.drain(..) {
+                        let _ = tx.send(result.clone());
                     }
                 }
             }
@@ -259,7 +252,6 @@ where
         for action in pending_actions {
             self.execute_action(action, ctx);
         }
-        started_connect
     }
 
     /// Executes a [`HandlerAction`] returned from a handler callback.
@@ -634,17 +626,12 @@ impl<H: WebSocketMessageHandler> Handler<Connect> for GenericWebSocketClient<H> 
     type Result = ResponseFuture<Result<(), Error>>;
 
     fn handle(&mut self, _msg: Connect, ctx: &mut Context<Self>) -> Self::Result {
+        // Resolved by the CompleteConnect effect: at once if the client is connected,
+        // else with the result of the connection attempt — the one this request
+        // starts, or the one that is running already.
         let (tx, rx) = oneshot::channel();
-        if self.dispatch(Event::ConnectRequested, ctx) {
-            // Accepted: resolved by the CompleteConnect effect. A previous pending
-            // request cannot normally exist here; resolve it defensively if it does.
-            if let Some(previous) = self.pending_connect.replace(tx) {
-                let _ = previous.send(Err(Error::StateChanged));
-            }
-        } else {
-            // Rejected: already connecting or connected.
-            let _ = tx.send(Err(Error::StateChanged));
-        }
+        self.pending_connects.push(tx);
+        self.dispatch(Event::ConnectRequested, ctx);
         Box::pin(async move {
             match rx.await {
                 Ok(result) => result,
@@ -989,15 +976,115 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn second_connect_while_connected_returns_state_changed() {
+    async fn connect_while_connected_succeeds() {
         let (sink, _sent) = mock_sink(usize::MAX);
         let (_script, stream) = scripted_stream();
-        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let (transport, attempts) = MockTransport::scripted(vec![Ok((sink, stream))]);
         let addr = client(transport, TestHandler::default());
 
         addr.send(Connect).await.unwrap().unwrap();
         let second = addr.send(Connect).await.unwrap();
-        assert_eq!(second, Err(Error::StateChanged));
+
+        assert_eq!(second, Ok(()));
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+    }
+
+    #[actix_rt::test]
+    async fn connect_joins_the_attempt_of_connect_on_start() {
+        let (sink, _sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, attempts) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let config = WebSocketConfig::builder()
+            .connect_on_start(true)
+            .build()
+            .unwrap();
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            "ws://localhost",
+            config,
+            TestHandler::default(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .start();
+
+        // The way to wait for the connection of a client that connects on start.
+        let result = addr.send(Connect).await.unwrap();
+
+        assert_eq!(result, Ok(()));
+        assert!(addr.send(IsConnected).await.unwrap());
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+    }
+
+    #[actix_rt::test]
+    async fn concurrent_connects_get_the_result_of_the_one_attempt() {
+        let (transport, attempts) =
+            MockTransport::scripted(vec![Err(Error::WebSocket("refused".into()))]);
+        let addr = client(transport, TestHandler::default());
+
+        let (first, second) = futures::join!(addr.send(Connect), addr.send(Connect));
+
+        assert_eq!(first.unwrap(), Err(Error::WebSocket("refused".into())));
+        assert_eq!(second.unwrap(), Err(Error::WebSocket("refused".into())));
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+        addr.do_send(Disconnect);
+    }
+
+    #[actix_rt::test]
+    async fn disconnect_cancels_every_pending_connect() {
+        tokio::time::pause();
+        let (transport, _) = MockTransport::scripted(vec![]);
+        let addr = client(transport.hang_attempts(1), TestHandler::default());
+
+        let first = addr.send(Connect);
+        let second = addr.send(Connect);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        addr.do_send(Disconnect);
+
+        let first = tokio::time::timeout(Duration::from_secs(1), first).await;
+        let second = tokio::time::timeout(Duration::from_secs(1), second).await;
+        assert_eq!(first.unwrap().unwrap(), Err(Error::StateChanged));
+        assert_eq!(second.unwrap().unwrap(), Err(Error::StateChanged));
+    }
+
+    #[actix_rt::test]
+    async fn reconnect_while_connecting_starts_a_fresh_attempt() {
+        tokio::time::pause();
+        let (sink, _sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, attempts) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+
+        let refreshed_url = Arc::new(Mutex::new(None::<String>));
+        let provider_url = refreshed_url.clone();
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            "ws://original:1234",
+            config(),
+            handler.clone(),
+            // The attempt to the original address never completes.
+            Box::new(transport.hang_attempts(1)),
+        )
+        .unwrap()
+        .with_url_provider(move || provider_url.lock().unwrap().clone())
+        .start();
+        let connect = addr.send(Connect);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // The address changed: do not wait for the running attempt.
+        *refreshed_url.lock().unwrap() = Some("ws://refreshed:5678".into());
+        addr.do_send(Reconnect);
+
+        // The pending connect request is answered by the new attempt.
+        let result = tokio::time::timeout(Duration::from_secs(1), connect)
+            .await
+            .expect("Reconnect must replace the running attempt");
+        assert_eq!(result.unwrap(), Ok(()));
+        assert_eq!(handler.count("connected"), 1);
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts[0].uri.contains("original:1234"));
+        assert!(attempts[1].uri.contains("refreshed:5678"));
     }
 
     #[actix_rt::test]

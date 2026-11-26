@@ -10,6 +10,18 @@ use bytes::Bytes;
 pub struct IsConnected;
 
 /// Message sent to the [`crate::GenericWebSocketClient`] to initiate a connection.
+///
+/// The reply resolves with the result of the connection attempt:
+///
+/// - `Ok(())` once the client is connected — at once if it is connected already.
+/// - The error of the attempt if it failed. The client then retries according to its
+///   reconnect policy; the retries are not reported to this request.
+/// - [`Error::StateChanged`] if the attempt was cancelled by a [`Disconnect`],
+///   [`Close`] or [`Stop`].
+///
+/// A request while an attempt is running does not start a second attempt: it gets the
+/// result of the running one. This is also the way to wait for the first connection of
+/// a client with `connect_on_start`.
 #[derive(Message)]
 #[rtype(result = "Result<(), Error>")]
 pub struct Connect;
@@ -113,9 +125,11 @@ impl Close {
 /// Message sent to the [`crate::GenericWebSocketClient`] to gracefully close the
 /// current connection (if any) and establish a new one.
 ///
-/// In contrast to [`Disconnect`], the client reconnects according to its reconnect
-/// policy, starting with a fresh attempt counter. Useful to force a new connection
-/// after configuration or address changes.
+/// In contrast to [`Disconnect`], the client reconnects: it connects again at once,
+/// with a fresh attempt counter, and follows its reconnect policy if that fails.
+/// Useful to force a new connection after configuration or address changes, or when
+/// the network came back: a connection attempt that is running is cancelled and
+/// started again, with the address of the URL provider if there is one.
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Reconnect;

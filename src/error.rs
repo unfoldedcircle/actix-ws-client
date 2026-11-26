@@ -32,7 +32,9 @@ pub enum Error {
     WebSocket(String),
     /// Operation cannot proceed because the client is not connected.
     NotConnected,
-    /// The actor state changed during an in-flight operation, invalidating the result.
+    /// The operation was cancelled by a state change of the client: a
+    /// [`crate::Connect`] request whose connection attempt was cancelled by a
+    /// disconnect.
     StateChanged,
     /// Sending a message over the socket failed.
     SendFailed(String),
