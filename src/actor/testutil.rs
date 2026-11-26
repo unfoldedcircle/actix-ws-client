@@ -5,7 +5,7 @@ use super::transport::{BoxSink, BoxStream, ConnectFuture, ConnectOptions, Transp
 use crate::Error;
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio_tungstenite::tungstenite::Error as WsError;
@@ -174,6 +174,8 @@ pub(crate) struct RecordedAttempt {
 pub(crate) struct MockTransport {
     connections: Mutex<VecDeque<Result<(BoxSink, BoxStream), Error>>>,
     attempts: Arc<Mutex<Vec<RecordedAttempt>>>,
+    /// Number of attempts that never complete, before the scripted results are used.
+    hanging: AtomicUsize,
 }
 
 impl MockTransport {
@@ -186,9 +188,16 @@ impl MockTransport {
             Self {
                 connections: Mutex::new(connections.into()),
                 attempts: attempts.clone(),
+                hanging: AtomicUsize::new(0),
             },
             attempts,
         )
+    }
+
+    /// Lets the first `count` attempts hang: they never complete.
+    pub(crate) fn hang_attempts(self, count: usize) -> Self {
+        self.hanging.store(count, Ordering::SeqCst);
+        self
     }
 }
 
@@ -198,6 +207,10 @@ impl Transport for MockTransport {
             uri: request.uri().to_string(),
             options,
         });
+        if self.hanging.load(Ordering::SeqCst) > 0 {
+            self.hanging.fetch_sub(1, Ordering::SeqCst);
+            return Box::pin(std::future::pending());
+        }
         let next = self.connections.lock().unwrap().pop_front();
         Box::pin(async move {
             match next {

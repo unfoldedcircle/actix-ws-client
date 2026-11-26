@@ -586,17 +586,28 @@ mod tests {
     }
 
     #[test]
-    fn connect_while_connected_or_connecting_is_rejected() {
+    fn connect_while_connecting_joins_the_running_attempt() {
         let mut m = machine();
         let now = t0();
 
         m.on_event(Event::ConnectRequested, now);
-        // second request while Connecting: no effects -> adapter replies StateChanged
-        assert!(m.on_event(Event::ConnectRequested, now).is_empty());
-
-        m.on_event(Event::ConnectSucceeded { generation: 1 }, now);
+        // No second attempt and no reply: the running attempt answers the request.
         assert!(m.on_event(Event::ConnectRequested, now).is_empty());
         assert_eq!(m.generation(), 1);
+        assert_eq!(m.state(), ConnState::Connecting);
+    }
+
+    #[test]
+    fn connect_while_connected_succeeds_at_once() {
+        let mut m = machine();
+        let now = t0();
+        connect(&mut m, now);
+
+        let effects = m.on_event(Event::ConnectRequested, now);
+
+        assert_eq!(effects, vec![Effect::CompleteConnect { result: Ok(()) }]);
+        assert_eq!(m.generation(), 1);
+        assert!(m.is_connected());
     }
 
     // ------------------------------------------------------------------
@@ -1726,13 +1737,58 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_while_connecting_is_ignored() {
+    fn reconnect_while_connecting_starts_a_fresh_attempt() {
         let mut m = machine();
         let now = t0();
-
         m.on_event(Event::ConnectRequested, now);
-        assert!(m.on_event(Event::ReconnectRequested, now).is_empty());
-        assert_eq!(m.generation(), 1);
+
+        let effects = m.on_event(Event::ReconnectRequested, now);
+
+        // The running attempt is cancelled without an answer: a pending connect
+        // request is answered by the new attempt.
+        assert_eq!(
+            effects,
+            vec![
+                Effect::TearDownConnection {
+                    generation: 1,
+                    mode: Teardown::Abort
+                },
+                Effect::StartConnect {
+                    generation: 2,
+                    timeout: CONNECT_TIMEOUT
+                },
+            ]
+        );
+        assert_eq!(m.state(), ConnState::Connecting);
+
+        // A late result of the cancelled attempt is ignored.
+        let stale = m.on_event(
+            Event::ConnectFailed {
+                generation: 1,
+                error: Error::ConnectTimeout,
+            },
+            now,
+        );
+        assert!(stale.is_empty());
+        assert_eq!(m.state(), ConnState::Connecting);
+    }
+
+    #[test]
+    fn reconnect_while_connecting_resets_the_attempt_cap() {
+        let mut m = machine_with_cap(1);
+        let now = t0();
+        m.on_event(Event::ConnectRequested, now);
+        fail_current_attempt(&mut m, now);
+        // The one allowed retry is running.
+        m.on_event(Event::ReconnectTimerFired, now);
+        assert_eq!(m.state(), ConnState::Connecting);
+
+        m.on_event(Event::ReconnectRequested, now);
+        let effects = fail_current_attempt(&mut m, now);
+
+        // A fresh sequence: the failed attempt is retried, not given up.
+        assert!(reconnect_delay(&effects).is_some());
+        assert!(!effects.contains(&Effect::Emit(Callback::OnReconnectExhausted)));
     }
 
     #[test]
