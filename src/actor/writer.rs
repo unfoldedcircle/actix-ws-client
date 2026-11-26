@@ -37,7 +37,9 @@ pub(crate) struct WriteItem {
 /// the actor: the actor increments it for every message it enqueues.
 ///
 /// Returns `Some(error)` if a write failed (the caller reports it to the actor as a
-/// `WriteFailed` event) or `None` once the queue is closed and written.
+/// `WriteFailed` event) or `None` once the queue is closed and written. The returned
+/// error is the classified error of the socket, like a read error; the message that
+/// could not be written is answered with [`Error::SendFailed`].
 pub(crate) async fn run_writer(
     mut sink: BoxSink,
     mut rx: mpsc::UnboundedReceiver<WriteItem>,
@@ -54,10 +56,10 @@ pub(crate) async fn run_writer(
                 }
             }
             Err(e) => {
-                let error = Error::SendFailed(e.to_string());
                 if let Some(tx) = item.tx {
-                    let _ = tx.send(Err(error.clone()));
+                    let _ = tx.send(Err(Error::SendFailed(e.to_string())));
                 }
+                let error = Error::from(e);
                 // Fail everything still queued, then report.
                 rx.close();
                 while let Ok(item) = rx.try_recv() {
@@ -77,7 +79,7 @@ pub(crate) async fn run_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::testutil::mock_sink;
+    use crate::actor::testutil::{broken_pipe, failing_sink, mock_sink};
 
     fn text(msg: &str) -> Message {
         Message::Text(msg.into())
@@ -139,7 +141,7 @@ mod tests {
         drop(tx);
 
         let error = run_writer(sink, rx, queued(3)).await;
-        assert!(matches!(error, Some(Error::SendFailed(_))));
+        assert!(matches!(error, Some(Error::WebSocket(_))));
 
         assert_eq!(sent.lock().unwrap().len(), 1);
         let mut results = Vec::new();
@@ -149,6 +151,32 @@ mod tests {
         assert_eq!(results[0], Ok(()));
         assert!(matches!(results[1], Err(Error::SendFailed(_))));
         assert_eq!(results[2], Err(Error::NotConnected));
+    }
+
+    /// The connection ends with the error of the socket, classified like a read
+    /// error. `SendFailed` is the answer to the one message that could not be sent.
+    #[actix_rt::test]
+    async fn write_failure_is_reported_with_the_error_of_the_socket() {
+        let (sink, _sent) = failing_sink(0, broken_pipe);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        tx.send(WriteItem {
+            msg: text("message"),
+            tx: Some(done_tx),
+        })
+        .unwrap();
+        drop(tx);
+
+        let error = run_writer(sink, rx, queued(1)).await;
+
+        assert!(matches!(
+            error,
+            Some(Error::Io {
+                kind: std::io::ErrorKind::BrokenPipe,
+                ..
+            })
+        ));
+        assert!(matches!(done_rx.await.unwrap(), Err(Error::SendFailed(_))));
     }
 
     #[actix_rt::test]

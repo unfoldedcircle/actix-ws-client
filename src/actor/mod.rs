@@ -729,7 +729,8 @@ impl<H: WebSocketMessageHandler> Handler<SendBinary> for GenericWebSocketClient<
 #[cfg(test)]
 mod tests {
     use super::testutil::{
-        MockTransport, blocked_sink, mock_sink, scripted_stream, track_sink, track_stream,
+        MockTransport, blocked_sink, broken_pipe, failing_sink, mock_sink, scripted_stream,
+        track_sink, track_stream,
     };
     use super::*;
     use crate::{DisconnectReason, WebSocketConfig};
@@ -2230,5 +2231,34 @@ mod tests {
             1,
             "a stopped client stays stopped"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Classification of a lost connection
+    // ------------------------------------------------------------------
+
+    #[actix_rt::test]
+    async fn write_failure_is_reported_with_the_kind_of_the_io_error() {
+        let (sink, _sent) = failing_sink(0, broken_pipe);
+        let (_script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        // The message itself fails with `SendFailed` ...
+        let result = addr.send(SendText::new("lost")).await.unwrap();
+        assert!(matches!(result, Err(Error::SendFailed(_))));
+
+        // ... the connection ends with the classified error of the socket.
+        wait_until(|| handler.count("disconnected") == 1, "disconnected").await;
+        let log = handler.log.lock().unwrap();
+        assert!(
+            log.iter()
+                .any(|e| e.starts_with("closed:Error(Io { kind: BrokenPipe")),
+            "{log:?}"
+        );
+        drop(log);
+        addr.do_send(Disconnect);
     }
 }

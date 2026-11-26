@@ -57,12 +57,13 @@ impl WebSocketMessageHandler for RecordingHandler {
         Vec::new()
     }
     fn on_closed(&mut self, reason: &DisconnectReason) -> Vec<HandlerAction> {
-        if let DisconnectReason::ClosedByServer { code, reason } = reason {
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("closed-by-server:{code:?}:{reason}"));
-        }
+        let entry = match reason {
+            DisconnectReason::ClosedByServer { code, reason } => {
+                format!("closed-by-server:{code:?}:{reason}")
+            }
+            other => format!("closed:{other:?}"),
+        };
+        self.log.lock().unwrap().push(entry);
         Vec::new()
     }
     fn on_disconnected(&mut self) {
@@ -636,4 +637,34 @@ async fn connects_to_a_host_name_with_several_addresses() {
     client.send(SendText::new("hello")).await.unwrap().unwrap();
     wait_until(|| handler.contains("text:hello"), "text echo").await;
     client.send(Disconnect).await.unwrap();
+}
+
+/// The server goes away without a close frame — its process ended, or the device
+/// restarted. That is the most common way a connection is lost, and it is reported as
+/// the end of the stream: not as an error, and not as a protocol violation.
+#[actix_rt::test]
+async fn connection_dropped_by_the_server_is_reported_as_stream_ended() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(ws);
+    });
+
+    let handler = RecordingHandler::default();
+    let config = WebSocketConfig::builder()
+        .max_reconnect_attempts(0u32)
+        .build()
+        .unwrap();
+    let client = GenericWebSocketClient::new("e2e", url.as_str(), config, handler.clone())
+        .unwrap()
+        .start();
+    client.send(Connect).await.unwrap().unwrap();
+
+    wait_until(|| handler.count("disconnected") == 1, "disconnected").await;
+    let log = handler.log.lock().unwrap();
+    assert!(log.contains(&"closed:StreamEnded".to_string()), "{log:?}");
+    assert!(!log.iter().any(|e| e.starts_with("error:")), "{log:?}");
 }

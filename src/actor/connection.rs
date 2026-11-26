@@ -295,7 +295,7 @@ mod tests {
         assert!(matches!(written.await.unwrap(), Err(Error::SendFailed(_))));
         assert!(matches!(
             events.recv().await,
-            Some(ConnectionEvent::WriteFailed(Error::SendFailed(_)))
+            Some(ConnectionEvent::WriteFailed(Error::WebSocket(_)))
         ));
     }
 

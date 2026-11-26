@@ -36,7 +36,10 @@ pub enum Error {
     /// [`crate::Connect`] request whose connection attempt was cancelled by a
     /// disconnect.
     StateChanged,
-    /// Sending a message over the socket failed.
+    /// Sending a message over the socket failed: the answer to the
+    /// [`crate::SendText`] / [`crate::SendBinary`] request of that message. The
+    /// connection ends with the classified error of the socket, see
+    /// [`crate::DisconnectReason::Error`].
     SendFailed(String),
     /// The message was not accepted because the send queue is full, see
     /// [`crate::WebSocketConfig`] `max_send_queue`.

@@ -51,6 +51,13 @@ _Changes in the next release_
   1 ms, a `max_backoff` below `initial_backoff`, a zero `connect_timeout`, zero size limits and a `max_frame_size`
   above `max_message_size`.
 
+- A server that closes the connection without a close frame is reported as `DisconnectReason::StreamEnded`, without
+  an `on_error` call. Before, it was `DisconnectReason::Error` with a generic protocol error, and `StreamEnded` was
+  never used.
+- A failed write ends the connection with the classified error of the socket (`Error::Io` with its kind, `Error::Tls`),
+  like a failed read. Before, it was `Error::SendFailed` with a text. `SendFailed` remains the answer to the
+  `SendText` / `SendBinary` request that failed.
+
 ### Fixed
 - The reconnect delay is no longer cut to whole milliseconds.
 - A header with several values keeps all of them on a redirect and on a URL refresh. Before, only the first value

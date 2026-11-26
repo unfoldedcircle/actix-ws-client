@@ -7,6 +7,8 @@ use crate::Error;
 use crate::actor::transport::{BoxStream, frame_from_message};
 use crate::core::event::Frame;
 use futures::StreamExt;
+use tokio_tungstenite::tungstenite::Error as WsError;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 
 /// Output of the reader, forwarded to the actor.
 #[derive(Debug, PartialEq)]
@@ -32,7 +34,7 @@ where
                 }
             }
             Err(e) => {
-                forward(ReaderEvent::Ended(Some(Error::from(e)))).await;
+                forward(ReaderEvent::Ended(read_error(e))).await;
                 return;
             }
         }
@@ -40,11 +42,36 @@ where
     forward(ReaderEvent::Ended(None)).await;
 }
 
+/// Classifies the error that ended reading; `None` is a clean end of the stream.
+fn read_error(error: WsError) -> Option<Error> {
+    match error {
+        // The server closed the TCP connection without a close frame: its process
+        // ended, or the device restarted. The transport calls that a protocol error,
+        // but for the client it is simply the end of the connection — the most
+        // common one.
+        WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => None,
+        // The same on a TLS connection: it ended without the TLS close alert.
+        WsError::Io(error) if is_unexpected_eof(&error) => None,
+        error => Some(Error::from(error)),
+    }
+}
+
+/// Whether a TLS backend reports that the connection ended without the TLS close
+/// alert (`close_notify`).
+fn is_unexpected_eof(error: &std::io::Error) -> bool {
+    // rustls
+    error.kind() == std::io::ErrorKind::UnexpectedEof
+        // OpenSSL 3 has no error kind for it: "... unexpected eof while reading"
+        || error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("unexpected eof")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use tokio_tungstenite::tungstenite::Error as WsError;
     use tokio_tungstenite::tungstenite::protocol::Message;
 
     async fn collect(items: Vec<Result<Message, WsError>>) -> Vec<ReaderEvent> {
@@ -76,6 +103,75 @@ mod tests {
                 ReaderEvent::Ended(None),
             ]
         );
+    }
+
+    /// The server dropped the TCP connection without a close frame: its process
+    /// ended, or the device restarted. That is the end of the stream, not an error
+    /// of this client and not a protocol violation.
+    #[actix_rt::test]
+    async fn connection_dropped_by_the_server_is_a_clean_end() {
+        let events = collect(vec![
+            Ok(Message::Text("ok".into())),
+            Err(WsError::Protocol(
+                ProtocolError::ResetWithoutClosingHandshake,
+            )),
+        ])
+        .await;
+
+        assert_eq!(
+            events,
+            vec![
+                ReaderEvent::Frame(Frame::Text("ok".into())),
+                ReaderEvent::Ended(None),
+            ]
+        );
+    }
+
+    /// TLS backends report a connection that ended without the TLS close alert in
+    /// their own ways.
+    #[actix_rt::test]
+    async fn tls_connection_dropped_by_the_server_is_a_clean_end() {
+        use std::io::{Error as IoError, ErrorKind};
+
+        let rustls = IoError::new(
+            ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        );
+        let openssl =
+            IoError::other("error:0A000126:SSL routines:ssl3_read_n:unexpected eof while reading");
+        for error in [rustls, openssl] {
+            let events = collect(vec![Err(WsError::Io(error))]).await;
+            assert_eq!(events, vec![ReaderEvent::Ended(None)]);
+        }
+    }
+
+    /// A reset connection is a network error, reported with its kind.
+    #[actix_rt::test]
+    async fn reset_connection_stays_an_error() {
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+
+        let events = collect(vec![Err(WsError::Io(reset))]).await;
+
+        assert!(matches!(
+            events[..],
+            [ReaderEvent::Ended(Some(Error::Io {
+                kind: std::io::ErrorKind::ConnectionReset,
+                ..
+            }))]
+        ));
+    }
+
+    #[actix_rt::test]
+    async fn other_protocol_errors_stay_errors() {
+        let events = collect(vec![Err(WsError::Protocol(
+            ProtocolError::MaskedFrameFromServer,
+        ))])
+        .await;
+
+        assert!(matches!(
+            events[..],
+            [ReaderEvent::Ended(Some(Error::WebSocket(_)))]
+        ));
     }
 
     #[actix_rt::test]

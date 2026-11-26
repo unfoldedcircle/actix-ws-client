@@ -17,6 +17,8 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 pub(crate) struct MockSink {
     sent: Arc<Mutex<Vec<Message>>>,
     fail_after: usize,
+    /// Creates the error of a failing write.
+    error: fn() -> WsError,
 }
 
 impl futures::Sink<Message> for MockSink {
@@ -29,7 +31,7 @@ impl futures::Sink<Message> for MockSink {
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), WsError> {
         let mut sent = self.sent.lock().unwrap();
         if sent.len() >= self.fail_after {
-            return Err(WsError::ConnectionClosed);
+            return Err((self.error)());
         }
         sent.push(item);
         Ok(())
@@ -46,12 +48,27 @@ impl futures::Sink<Message> for MockSink {
 
 /// Creates a recording sink; `fail_after = usize::MAX` never fails.
 pub(crate) fn mock_sink(fail_after: usize) -> (BoxSink, Arc<Mutex<Vec<Message>>>) {
+    failing_sink(fail_after, || WsError::ConnectionClosed)
+}
+
+/// Creates a recording sink that fails with `error` once `fail_after` messages were
+/// accepted.
+pub(crate) fn failing_sink(
+    fail_after: usize,
+    error: fn() -> WsError,
+) -> (BoxSink, Arc<Mutex<Vec<Message>>>) {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let sink = MockSink {
         sent: sent.clone(),
         fail_after,
+        error,
     };
     (Box::pin(sink), sent)
+}
+
+/// The error of a write to a socket the server closed.
+pub(crate) fn broken_pipe() -> WsError {
+    WsError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
 }
 
 /// Sink that never becomes ready: every write blocks forever (stalled socket).

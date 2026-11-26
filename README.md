@@ -295,8 +295,8 @@ directly before `on_disconnected`:
 | `ClosedByServer { code, reason }` | Close frame of the server (`code` is `None` without a status) |
 | `ClosedLocally`                   | `Disconnect` / `Close` / `Reconnect`, or the actor stopped |
 | `KeepAliveTimeout`                | The server stopped answering pings                       |
-| `Error(error)`                    | Read or write failure                                    |
-| `StreamEnded`                     | Connection ended without a close frame and without an error |
+| `Error(error)`                    | Read or write failure: network error (`Error::Io` with its kind), TLS error, protocol violation. `on_error` is called before |
+| `StreamEnded`                     | The server closed the connection without a close frame: process ended, device restarted. No `on_error` |
 
 The reconnect policy does not depend on the reason: after a server close the client
 reconnects as before. A consumer that must not reconnect after a specific status

@@ -7,8 +7,8 @@
 
 use actix::prelude::*;
 use actix_ws_client::{
-    Certificate, Connect, Error, GenericWebSocketClient, HandlerAction, SendText, TlsConnector,
-    WebSocketConfig, WebSocketConfigBuilder, WebSocketMessageHandler,
+    Certificate, Connect, DisconnectReason, Error, GenericWebSocketClient, HandlerAction, SendText,
+    TlsConnector, WebSocketConfig, WebSocketConfigBuilder, WebSocketMessageHandler,
 };
 use futures::{SinkExt, StreamExt};
 use rcgen::{
@@ -26,6 +26,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 struct RecordingHandler {
     texts: Arc<Mutex<Vec<String>>>,
     errors: Arc<Mutex<Vec<Error>>>,
+    closed: Arc<Mutex<Vec<DisconnectReason>>>,
 }
 
 impl WebSocketMessageHandler for RecordingHandler {
@@ -35,6 +36,10 @@ impl WebSocketMessageHandler for RecordingHandler {
     }
     fn on_error(&mut self, error: &Error) -> Vec<HandlerAction> {
         self.errors.lock().unwrap().push(error.clone());
+        Vec::new()
+    }
+    fn on_closed(&mut self, reason: &DisconnectReason) -> Vec<HandlerAction> {
+        self.closed.lock().unwrap().push(reason.clone());
         Vec::new()
     }
 }
@@ -107,6 +112,9 @@ async fn spawn_tls_echo_server() -> TlsServer {
                 let (mut sink, mut source) = ws.split();
                 while let Some(Ok(msg)) = source.next().await {
                     match msg {
+                        // Drops the connection without closing it, like a server
+                        // whose process ends.
+                        Message::Text(text) if text.as_str() == "drop me" => break,
                         Message::Text(_) => {
                             if sink.send(msg).await.is_err() {
                                 break;
@@ -325,4 +333,32 @@ fn tls_connector_cannot_be_combined_with_other_tls_options() {
         .build();
 
     assert!(result.is_err());
+}
+
+/// A server that goes away without closing the TLS connection is reported like on a
+/// plain connection: as the end of the stream, not as an error.
+#[actix_rt::test]
+async fn connection_dropped_by_the_server_is_reported_as_stream_ended() {
+    let server = spawn_tls_echo_server().await;
+    let handler = RecordingHandler::default();
+    let config = config().danger_accept_invalid_certs(true).build().unwrap();
+    let client = start_client(&server.url, config, handler.clone());
+    client.send(Connect).await.unwrap().unwrap();
+
+    client
+        .send(SendText::new("drop me"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while handler.closed.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "timed out waiting for the close");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        *handler.closed.lock().unwrap(),
+        [DisconnectReason::StreamEnded]
+    );
+    assert!(handler.errors.lock().unwrap().is_empty());
 }
