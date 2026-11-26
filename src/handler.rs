@@ -32,9 +32,16 @@ pub enum DisconnectReason {
     ClosedLocally,
     /// The server stopped answering keep-alive pings.
     KeepAliveTimeout,
-    /// Reading from or writing to the socket failed.
+    /// Reading from or writing to the socket failed: a network error
+    /// ([`Error::Io`], e.g. a reset connection), a TLS error, or a violation of the
+    /// WebSocket protocol by the server. [`WebSocketMessageHandler::on_error`] is
+    /// called with the same error before.
     Error(Error),
-    /// The connection ended without a close frame and without an error.
+    /// The server closed the connection without a close frame, e.g. because its
+    /// process ended or the device restarted. Not reported as an error.
+    ///
+    /// A connection that was reset instead of closed is an
+    /// [`DisconnectReason::Error`] with [`Error::Io`] of kind `ConnectionReset`.
     StreamEnded,
 }
 

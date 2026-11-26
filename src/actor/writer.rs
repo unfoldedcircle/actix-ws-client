@@ -37,7 +37,9 @@ pub(crate) struct WriteItem {
 /// the actor: the actor increments it for every message it enqueues.
 ///
 /// Returns `Some(error)` if a write failed (the caller reports it to the actor as a
-/// `WriteFailed` event) or `None` once the queue is closed and written.
+/// `WriteFailed` event) or `None` once the queue is closed and written. The returned
+/// error is the classified error of the socket, like a read error; the message that
+/// could not be written is answered with [`Error::SendFailed`].
 pub(crate) async fn run_writer(
     mut sink: BoxSink,
     mut rx: mpsc::UnboundedReceiver<WriteItem>,
@@ -54,10 +56,10 @@ pub(crate) async fn run_writer(
                 }
             }
             Err(e) => {
-                let error = Error::SendFailed(e.to_string());
                 if let Some(tx) = item.tx {
-                    let _ = tx.send(Err(error.clone()));
+                    let _ = tx.send(Err(Error::SendFailed(e.to_string())));
                 }
+                let error = Error::from(e);
                 // Fail everything still queued, then report.
                 rx.close();
                 while let Ok(item) = rx.try_recv() {
@@ -139,7 +141,7 @@ mod tests {
         drop(tx);
 
         let error = run_writer(sink, rx, queued(3)).await;
-        assert!(matches!(error, Some(Error::SendFailed(_))));
+        assert!(matches!(error, Some(Error::WebSocket(_))));
 
         assert_eq!(sent.lock().unwrap().len(), 1);
         let mut results = Vec::new();
