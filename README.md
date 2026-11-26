@@ -49,8 +49,8 @@ TLS options of `WebSocketConfig`, working with both backends:
   actor; optionally chain `.with_url_provider(...)`; start it with `.start()`.
 - Messages: `Connect`, `Disconnect` (close, stop reconnecting), `Close` (like
   `Disconnect`, with a close status code and reason), `Reconnect` (close,
-  reconnect per policy with a fresh attempt counter), `SendText`, `SendBinary`,
-  `IsConnected`.
+  reconnect per policy with a fresh attempt counter), `Stop` (close, stop the actor),
+  `SendText`, `SendBinary`, `IsConnected`.
 - `WebSocketMessageHandler` — callback trait (`on_text`, `on_binary`, `on_connected`,
   `on_closed`, `on_disconnected`, `on_error`, `on_reconnect_exhausted`, `redact_trace`). `on_text` / `on_binary` /
   `on_connected` return a `Vec<HandlerAction>` executed by the client right after the
@@ -66,6 +66,27 @@ TLS options of `WebSocketConfig`, working with both backends:
 
 See the crate-level rustdoc for a quick-start example, and
 [`examples/echo_client.rs`](examples/echo_client.rs) for a runnable client.
+
+## Lifecycle
+
+The address returned by `start()` is the handle of the client. The client runs for as
+long as an address of it exists; a `Recipient` counts as an address, a `WeakAddr` does
+not.
+
+| What happens                         | Effect                                                         |
+|--------------------------------------|----------------------------------------------------------------|
+| `Disconnect` / `Close`               | Connection closed, no reconnect. The actor keeps running and accepts a new `Connect` |
+| `Stop`                               | Connection closed, actor stopped. Other addresses get a closed mailbox |
+| Last address dropped                 | Like `Stop`, without a reply                                   |
+
+A client that is stopped closes its connection gracefully, in every state: the close
+handshake is completed in the background, a running connection attempt or a pending
+reconnect is cancelled, and `on_closed` / `on_disconnected` are called if it was
+connected. `Stop` resolves once the connection is closed — await it for a clean
+shutdown.
+
+Keep the address also for a client that only receives (`connect_on_start`): a client
+without an address stops right after it started.
 
 ## Architecture: sans-IO core + thin actor adapter
 

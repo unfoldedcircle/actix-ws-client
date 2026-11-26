@@ -18,13 +18,17 @@ use crate::core::event::{CloseInfo, Event, Frame};
 use crate::core::{CoreConfig, Machine};
 use crate::error::Error;
 use crate::handler::{HandlerAction, TraceDirection, WebSocketMessageHandler};
-use crate::message::{Close, Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
+use crate::message::{
+    Close, Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText, Stop,
+};
 use crate::tls::TlsContext;
 use actix::fut::{ActorFutureExt, ActorStreamExt, wrap_future, wrap_stream};
 use actix::prelude::*;
 use connection::{Closed, ConnectionEvent, ConnectionHandle};
 use log::{debug, info, trace, warn};
 use reader::ReaderEvent;
+use std::pin::Pin;
+use std::task::{self, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -39,6 +43,36 @@ use writer::WriteItem;
 
 /// Per-attempt URL provider, see [`GenericWebSocketClient::with_url_provider`].
 type UrlProvider = Box<dyn FnMut() -> Option<String> + Send>;
+
+/// Stops the actor once its last address is dropped.
+///
+/// actix keeps an actor running for as long as its context has work to do — here the
+/// events of a connection, a connection attempt, the keep-alive and reconnect timers.
+/// Without this watch a client would stay connected, or keep reconnecting, with nobody
+/// left to talk to it or to stop it.
+///
+/// The watch needs no waker of its own: actix wakes the actor when its last address is
+/// dropped, and polls every future of the context whenever the actor is polled.
+struct AddressWatch;
+
+impl<H: WebSocketMessageHandler> ActorFuture<GenericWebSocketClient<H>> for AddressWatch {
+    type Output = ();
+
+    fn poll(
+        self: Pin<&mut Self>,
+        actor: &mut GenericWebSocketClient<H>,
+        ctx: &mut Context<GenericWebSocketClient<H>>,
+        _task: &mut task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        if ctx.connected() {
+            return Poll::Pending;
+        }
+        debug!("[{}] Last address dropped: stopping", actor.id);
+        // `stopped` closes the connection.
+        ctx.stop();
+        Poll::Ready(())
+    }
+}
 
 /// The established connection: its task and the actor future receiving its events.
 struct Connection {
@@ -58,6 +92,14 @@ struct Connection {
 ///
 /// All connection policy lives in a pure, synchronous state machine
 /// ([`crate::core::Machine`]); this actor only executes its effects.
+///
+/// # Lifecycle
+///
+/// The address returned by `start()` is the handle of the client. The client runs for
+/// as long as an address (or a recipient) of it exists — keep it also for a client
+/// that only receives. When the last address is dropped, the client closes its
+/// connection gracefully and stops, as it does on a [`Stop`] message. Weak addresses
+/// do not keep a client running.
 pub struct GenericWebSocketClient<H>
 where
     H: WebSocketMessageHandler,
@@ -565,6 +607,7 @@ impl<H: WebSocketMessageHandler> Actor for GenericWebSocketClient<H> {
 
     fn started(&mut self, ctx: &mut Self::Context) {
         debug!("[{}] WebSocket actor started", self.id);
+        ctx.spawn(AddressWatch);
         if self.config.connect_on_start {
             debug!("[{}] Auto-connecting on start", self.id);
             self.dispatch(Event::ConnectRequested, ctx);
@@ -573,6 +616,8 @@ impl<H: WebSocketMessageHandler> Actor for GenericWebSocketClient<H> {
 
     fn stopped(&mut self, ctx: &mut Self::Context) {
         debug!("[{}] WebSocket actor stopped", self.id);
+        // Graceful close: the detached connection task completes the close handshake
+        // after the actor is gone.
         self.dispatch(Event::DisconnectRequested, ctx);
     }
 }
@@ -615,6 +660,17 @@ impl<H: WebSocketMessageHandler> Handler<Disconnect> for GenericWebSocketClient<
     fn handle(&mut self, _msg: Disconnect, ctx: &mut Context<Self>) -> Self::Result {
         debug!("[{}] Explicit disconnect requested", self.id);
         self.dispatch(Event::DisconnectRequested, ctx);
+        Box::pin(self.closed())
+    }
+}
+
+impl<H: WebSocketMessageHandler> Handler<Stop> for GenericWebSocketClient<H> {
+    type Result = ResponseFuture<()>;
+
+    fn handle(&mut self, _msg: Stop, ctx: &mut Context<Self>) -> Self::Result {
+        debug!("[{}] Stop requested", self.id);
+        self.dispatch(Event::DisconnectRequested, ctx);
+        ctx.stop();
         Box::pin(self.closed())
     }
 }
@@ -1692,5 +1748,155 @@ mod tests {
             1,
             "the actor must stop: nothing may keep it alive"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Actor lifecycle
+    // ------------------------------------------------------------------
+
+    /// Whether the actor is gone: it owns the second reference to the handler's log.
+    fn actor_stopped(handler: &TestHandler) -> bool {
+        Arc::strong_count(&handler.log) == 1
+    }
+
+    #[actix_rt::test]
+    async fn dropping_the_last_address_closes_a_connected_client() {
+        tokio::time::pause();
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        drop(addr);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            actor_stopped(&handler),
+            "a client nobody can reach anymore must not stay connected"
+        );
+        // The connection is closed gracefully, with the usual callbacks.
+        assert!(sent_contains(&sent, is_close));
+        assert!(handler.log_contains("closed:ClosedLocally"));
+        assert_eq!(handler.count("disconnected"), 1);
+    }
+
+    #[actix_rt::test]
+    async fn dropping_the_last_address_stops_a_reconnecting_client() {
+        tokio::time::pause();
+        // Every connection attempt fails.
+        let (transport, attempts) = MockTransport::scripted(vec![]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        assert!(addr.send(Connect).await.unwrap().is_err());
+
+        drop(addr);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let attempts_at_drop = attempts.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        assert!(
+            actor_stopped(&handler),
+            "a client nobody can reach anymore must not keep reconnecting"
+        );
+        assert_eq!(attempts.lock().unwrap().len(), attempts_at_drop);
+    }
+
+    #[actix_rt::test]
+    async fn dropping_the_last_address_stops_an_idle_client() {
+        let (transport, _) = MockTransport::scripted(vec![]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        assert!(!addr.send(IsConnected).await.unwrap());
+
+        drop(addr);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(actor_stopped(&handler));
+        assert_eq!(handler.count("disconnected"), 0);
+    }
+
+    #[actix_rt::test]
+    async fn another_address_keeps_the_client_running() {
+        tokio::time::pause();
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        // A recipient is an address, too.
+        let recipient = addr.clone().recipient::<SendText>();
+        drop(addr);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert!(!actor_stopped(&handler));
+        recipient
+            .send(SendText::new("still here"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(sent_contains(
+            &sent,
+            |m| matches!(m, Message::Text(t) if t.as_str() == "still here")
+        ));
+
+        drop(recipient);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(actor_stopped(&handler));
+    }
+
+    #[actix_rt::test]
+    async fn stop_closes_the_connection_and_stops_the_actor() {
+        tokio::time::pause();
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (sink, sink_dropped) = track_sink(sink);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        let stop = addr.send(Stop);
+        tokio::pin!(stop);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut stop)
+                .await
+                .is_err(),
+            "Stop must not resolve before the server closed"
+        );
+        // The actor is gone, although an address of it still exists.
+        assert!(actor_stopped(&handler));
+        assert!(sent_contains(&sent, is_close));
+        assert!(handler.log_contains("closed:ClosedLocally"));
+        assert_eq!(handler.count("disconnected"), 1);
+        assert!(addr.send(IsConnected).await.is_err());
+
+        // The close handshake completes without the actor.
+        script.unbounded_send(Ok(Message::Close(None))).unwrap();
+        drop(script);
+        tokio::time::timeout(Duration::from_secs(1), stop)
+            .await
+            .expect("Stop must resolve once the server closed")
+            .unwrap();
+        assert!(sink_dropped.load(SeqCst));
+    }
+
+    #[actix_rt::test]
+    async fn stop_ends_a_reconnecting_client() {
+        tokio::time::pause();
+        let (transport, attempts) = MockTransport::scripted(vec![]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        assert!(addr.send(Connect).await.unwrap().is_err());
+
+        addr.send(Stop).await.unwrap();
+        let attempts_at_stop = attempts.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        assert!(actor_stopped(&handler));
+        assert_eq!(attempts.lock().unwrap().len(), attempts_at_stop);
     }
 }

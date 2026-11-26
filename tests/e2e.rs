@@ -8,7 +8,7 @@
 use actix::prelude::*;
 use actix_ws_client::{
     Close, Connect, Disconnect, DisconnectReason, Error, GenericWebSocketClient, HandlerAction,
-    IsConnected, SendBinary, SendText, WebSocketConfig, WebSocketMessageHandler,
+    IsConnected, SendBinary, SendText, Stop, WebSocketConfig, WebSocketMessageHandler,
 };
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
@@ -507,4 +507,67 @@ async fn server_close_is_answered_once_with_its_status() {
     .await;
     assert_eq!(*observed.lock().unwrap(), ["close:4002", "end"]);
     assert!(handler.contains("closed-by-server:Some(4002):maintenance"));
+}
+
+/// Records the frames a server receives until the client is gone.
+async fn spawn_observing_server() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let log = observed.clone();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        loop {
+            let entry = match ws.next().await {
+                Some(Ok(Message::Close(Some(close)))) => {
+                    format!("close:{}", u16::from(close.code))
+                }
+                Some(Ok(other)) => format!("{other:?}"),
+                Some(Err(e)) => format!("read error: {e}"),
+                None => "end".to_string(),
+            };
+            let done = entry == "end" || entry.starts_with("read error");
+            log.lock().unwrap().push(entry);
+            if done {
+                break;
+            }
+        }
+    });
+    (url, observed)
+}
+
+#[actix_rt::test]
+async fn dropping_the_last_address_closes_the_connection_cleanly() {
+    let (url, observed) = spawn_observing_server().await;
+    let handler = RecordingHandler::default();
+    let client = start_client(&url, handler.clone());
+    client.send(Connect).await.unwrap().unwrap();
+
+    drop(client);
+
+    wait_until(
+        || {
+            let log = observed.lock().unwrap();
+            log.iter().any(|e| e == "end" || e.contains("error"))
+        },
+        "server finished",
+    )
+    .await;
+    // The close handshake is completed although the actor is gone.
+    assert_eq!(*observed.lock().unwrap(), ["close:1000", "end"]);
+    assert_eq!(handler.count("disconnected"), 1);
+}
+
+#[actix_rt::test]
+async fn stop_resolves_after_a_clean_close() {
+    let (url, observed) = spawn_observing_server().await;
+    let client = start_client(&url, RecordingHandler::default());
+    client.send(Connect).await.unwrap().unwrap();
+
+    client.send(Stop).await.unwrap();
+
+    // Nothing to wait for: the connection is closed when `Stop` resolves.
+    assert_eq!(*observed.lock().unwrap(), ["close:1000", "end"]);
+    assert!(client.send(IsConnected).await.is_err());
 }

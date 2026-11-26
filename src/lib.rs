@@ -21,6 +21,12 @@
 //! must install a `CryptoProvider`. See `README.md` for the details and the TLS
 //! options of [`WebSocketConfig`].
 //!
+//! ## Lifecycle
+//!
+//! The address returned by `start()` is the handle of the client: the client runs for
+//! as long as an address of it exists. When the last address is dropped, or on a
+//! [`Stop`] message, the client closes its connection gracefully and stops.
+//!
 //! ## Callback contract
 //!
 //! [`WebSocketMessageHandler::on_connected`] and
@@ -82,7 +88,7 @@ pub use actor::GenericWebSocketClient;
 pub use config::{WebSocketConfig, WebSocketConfigBuilder, WebSocketConfigBuilderError};
 pub use error::Error;
 pub use handler::{DisconnectReason, HandlerAction, TraceDirection, WebSocketMessageHandler};
-pub use message::{Close, Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
+pub use message::{Close, Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText, Stop};
 pub use tls::Certificate;
 #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
 pub use tls::TlsConnector;
