@@ -21,7 +21,8 @@ pub enum DisconnectReason {
     ClosedByServer {
         /// The close status code (RFC 6455 §7.4), e.g. 1000 (normal), 1001 (going
         /// away), 1008 (policy violation) or an application code 4000–4999. `None`
-        /// if the close frame carried no status.
+        /// if the close frame carried no status. A code that must not be sent in a
+        /// close frame (RFC 6455 §7.4) is reported as 1002 (protocol error).
         code: Option<u16>,
         /// The close reason; empty if the server gave none.
         reason: String,

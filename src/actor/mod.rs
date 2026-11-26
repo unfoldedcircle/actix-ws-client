@@ -92,8 +92,8 @@ struct Connection {
 /// exponential backoff and keep-alive pings, and forwards received messages to a
 /// provided [`WebSocketMessageHandler`].
 ///
-/// All connection policy lives in a pure, synchronous state machine
-/// ([`crate::core::Machine`]); this actor only executes its effects.
+/// All connection policy lives in a pure, synchronous state machine; this actor only
+/// executes its effects.
 ///
 /// # Lifecycle
 ///
@@ -1395,7 +1395,7 @@ mod tests {
     }
 
     // ========================================================================
-    // HandlerAction execution (§4a)
+    // HandlerAction execution
     // ========================================================================
 
     #[actix_rt::test]
@@ -1535,7 +1535,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Maximum reconnection attempts (§5.2)
+    // Maximum reconnection attempts
     // ========================================================================
 
     #[actix_rt::test]
@@ -1569,7 +1569,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Per-attempt URL refresh (§5.4)
+    // Per-attempt URL refresh
     // ========================================================================
 
     #[actix_rt::test]
@@ -1724,7 +1724,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Frame/message size limits (§5.1)
+    // Frame/message size limits
     // ========================================================================
 
     #[actix_rt::test]
