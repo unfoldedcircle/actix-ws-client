@@ -37,8 +37,8 @@ use tokio_tungstenite::tungstenite::handshake::client::Request as WsRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig as WsProtocolConfig;
 use transport::{
-    BoxSink, BoxStream, ConnectOptions, Transport, TungsteniteTransport, message_from_frame,
-    validate_close,
+    BoxSink, BoxStream, ConnectOptions, Transport, TungsteniteTransport, copy_headers,
+    message_from_frame, validate_close,
 };
 use writer::WriteItem;
 
@@ -403,13 +403,7 @@ where
             .as_str()
             .into_client_request()
             .map_err(|e| Error::InvalidRequest(format!("provider URL {url:?}: {e}")))?;
-        for (name, value) in self.request.headers() {
-            if !new_request.headers().contains_key(name) {
-                new_request
-                    .headers_mut()
-                    .insert(name.clone(), value.clone());
-            }
-        }
+        copy_headers(&self.request, &mut new_request, |_| true);
         if new_request.uri() != self.request.uri() {
             debug!("[{}] Using refreshed URL: {url}", self.id);
         }
@@ -1560,6 +1554,41 @@ mod tests {
         assert_eq!(attempts.len(), 2);
         assert!(attempts[0].uri.contains("original:1234"));
         assert!(attempts[1].uri.contains("refreshed:5678"));
+    }
+
+    #[actix_rt::test]
+    async fn url_refresh_keeps_all_values_of_a_header() {
+        let (sink, _sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, attempts) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let mut request = "ws://original:1234".into_client_request().unwrap();
+        for protocol in ["v2", "v1"] {
+            request
+                .headers_mut()
+                .append("sec-websocket-protocol", protocol.parse().unwrap());
+        }
+
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            request,
+            config(),
+            TestHandler::default(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .with_url_provider(|| Some("ws://refreshed:5678".into()))
+        .start();
+        addr.send(Connect).await.unwrap().unwrap();
+
+        let attempts = attempts.lock().unwrap();
+        assert!(attempts[0].uri.contains("refreshed:5678"));
+        let protocols: Vec<_> = attempts[0]
+            .headers
+            .get_all("sec-websocket-protocol")
+            .iter()
+            .collect();
+        assert_eq!(protocols, ["v2", "v1"]);
+        assert_eq!(attempts[0].headers.get_all("host").iter().count(), 1);
     }
 
     #[actix_rt::test]

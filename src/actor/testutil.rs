@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::handshake::client::Request as WsRequest;
+use tokio_tungstenite::tungstenite::http::HeaderMap;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 /// Sink that records sent messages; fails once `fail_after` messages were accepted.
@@ -166,6 +167,8 @@ pub(crate) fn scripted_stream() -> (StreamScript, BoxStream) {
 pub(crate) struct RecordedAttempt {
     /// Request URI of the attempt.
     pub uri: String,
+    /// Request headers of the attempt.
+    pub headers: HeaderMap,
     /// Connect options of the attempt.
     pub options: ConnectOptions,
 }
@@ -205,6 +208,7 @@ impl Transport for MockTransport {
     fn connect(&self, request: WsRequest, options: ConnectOptions) -> ConnectFuture {
         self.attempts.lock().unwrap().push(RecordedAttempt {
             uri: request.uri().to_string(),
+            headers: request.headers().clone(),
             options,
         });
         if self.hanging.load(Ordering::SeqCst) > 0 {

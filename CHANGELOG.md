@@ -35,7 +35,14 @@ _Changes in the next release_
   was acknowledged.
 - The addresses of a host name are raced when connecting (RFC 8305) instead of being tried one after another.
 
+- A redirect from `wss://` to a plain text target is refused.
+- On a redirect to another origin only `Origin`, `User-Agent`, `Sec-WebSocket-Protocol` and
+  `Sec-WebSocket-Extensions` are forwarded. Before, only `Authorization` and `Cookie` were dropped. Another scheme
+  or port is another origin now; the default port of the scheme is not.
+
 ### Fixed
+- A header with several values keeps all of them on a redirect and on a URL refresh. Before, only the first value
+  was kept.
 - A host name with an address that does not answer, typically IPv6 without a route, no longer uses up the whole
   connect timeout: the next address is tried after 250 ms.
 - Every connection attempt uses a new `Sec-WebSocket-Key`. Before, the key of the first attempt was reused.

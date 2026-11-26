@@ -329,8 +329,15 @@ The former `pong_timeout` knob was removed: with tick-based keep-alive it had no
 effect. The builder validates `backoff_factor >= 1.0`, `max_missed_pongs >= 1` and
 non-zero `ping_interval` / `initial_backoff` / `max_send_queue`.
 
-Redirects support absolute, scheme-relative and absolute-path `Location` values;
-`Authorization` / `Cookie` headers are not forwarded on cross-origin redirects.
+Redirects support absolute, scheme-relative and absolute-path `Location` values.
+
+- A redirect from `wss://` to a plain text target (`ws://`, `http://`) is refused and
+  fails the connection attempt.
+- On a redirect to another origin — another scheme, host or port — only `Origin`,
+  `User-Agent`, `Sec-WebSocket-Protocol` and `Sec-WebSocket-Extensions` are forwarded.
+  Every other header of the request may be a credential (`Authorization`, `Cookie`,
+  an API key header) and is dropped.
+- `max_redirects(0)` does not follow redirects at all.
 
 ## Testing
 
