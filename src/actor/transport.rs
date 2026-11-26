@@ -461,6 +461,106 @@ mod tests {
         assert_eq!(new.headers().get(AUTHORIZATION).unwrap(), "Bearer secret");
     }
 
+    /// A request with credentials and other headers set by the user.
+    fn request_with_headers(url: &str) -> WsRequest {
+        let mut req = request(url);
+        let headers = req.headers_mut();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+        headers.insert(COOKIE, HeaderValue::from_static("session=secret"));
+        headers.insert("proxy-authorization", HeaderValue::from_static("secret"));
+        headers.insert("x-api-key", HeaderValue::from_static("secret"));
+        headers.insert("user-agent", HeaderValue::from_static("test-agent"));
+        headers.insert("origin", HeaderValue::from_static("https://app.example"));
+        headers.append("sec-websocket-protocol", HeaderValue::from_static("v2"));
+        headers.append("sec-websocket-protocol", HeaderValue::from_static("v1"));
+        req
+    }
+
+    fn values<'a>(req: &'a WsRequest, name: &str) -> Vec<&'a str> {
+        req.headers()
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn redirect_from_tls_to_plain_text_is_refused() {
+        let req = request_with_headers("wss://example.com/socket");
+
+        // The same host over plain text would get the credentials in clear text.
+        assert!(build_redirect_request(&req, "http://example.com/socket").is_err());
+        assert!(build_redirect_request(&req, "ws://example.com/socket").is_err());
+        assert!(build_redirect_request(&req, "ws://other.example.com/socket").is_err());
+        // The other direction is fine.
+        let plain = request("ws://example.com/socket");
+        assert!(build_redirect_request(&plain, "wss://example.com/socket").is_ok());
+    }
+
+    #[test]
+    fn cross_origin_redirect_forwards_only_harmless_headers() {
+        let req = request_with_headers("wss://example.com/socket");
+
+        let new = build_redirect_request(&req, "wss://other.example.com/ws").unwrap();
+
+        for credential in [
+            "authorization",
+            "cookie",
+            "proxy-authorization",
+            "x-api-key",
+        ] {
+            assert!(
+                new.headers().get(credential).is_none(),
+                "{credential} must not be sent to another origin"
+            );
+        }
+        assert_eq!(values(&new, "user-agent"), ["test-agent"]);
+        assert_eq!(values(&new, "origin"), ["https://app.example"]);
+        assert_eq!(values(&new, "sec-websocket-protocol"), ["v2", "v1"]);
+    }
+
+    #[test]
+    fn another_scheme_or_port_is_another_origin() {
+        let req = request_with_headers("ws://example.com/socket");
+
+        let tls = build_redirect_request(&req, "wss://example.com/socket").unwrap();
+        assert!(tls.headers().get(AUTHORIZATION).is_none());
+        let port = build_redirect_request(&req, "ws://example.com:8080/socket").unwrap();
+        assert!(port.headers().get(AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn default_port_and_host_case_do_not_change_the_origin() {
+        let req = request_with_headers("wss://example.com/socket");
+
+        for location in [
+            "wss://example.com:443/other",
+            "https://EXAMPLE.com/other",
+            "//example.com/other",
+            "/other",
+        ] {
+            let new = build_redirect_request(&req, location).unwrap();
+            assert_eq!(
+                values(&new, "authorization"),
+                ["Bearer secret"],
+                "{location}"
+            );
+            assert_eq!(values(&new, "x-api-key"), ["secret"], "{location}");
+        }
+    }
+
+    #[test]
+    fn same_origin_redirect_keeps_all_values_of_a_header() {
+        let req = request_with_headers("wss://example.com/socket");
+
+        let new = build_redirect_request(&req, "/other").unwrap();
+
+        assert_eq!(values(&new, "sec-websocket-protocol"), ["v2", "v1"]);
+        // Headers of the handshake are created for the new request, not copied twice.
+        assert_eq!(new.headers().get_all("host").iter().count(), 1);
+        assert_eq!(new.headers().get_all("sec-websocket-key").iter().count(), 1);
+    }
+
     #[test]
     fn frame_message_roundtrip() {
         assert_eq!(

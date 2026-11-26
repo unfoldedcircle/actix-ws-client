@@ -1563,6 +1563,41 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn url_refresh_keeps_all_values_of_a_header() {
+        let (sink, _sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, attempts) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let mut request = "ws://original:1234".into_client_request().unwrap();
+        for protocol in ["v2", "v1"] {
+            request
+                .headers_mut()
+                .append("sec-websocket-protocol", protocol.parse().unwrap());
+        }
+
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            request,
+            config(),
+            TestHandler::default(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .with_url_provider(|| Some("ws://refreshed:5678".into()))
+        .start();
+        addr.send(Connect).await.unwrap().unwrap();
+
+        let attempts = attempts.lock().unwrap();
+        assert!(attempts[0].uri.contains("refreshed:5678"));
+        let protocols: Vec<_> = attempts[0]
+            .headers
+            .get_all("sec-websocket-protocol")
+            .iter()
+            .collect();
+        assert_eq!(protocols, ["v2", "v1"]);
+        assert_eq!(attempts[0].headers.get_all("host").iter().count(), 1);
+    }
+
+    #[actix_rt::test]
     async fn invalid_provider_url_fails_the_attempt() {
         let (transport, attempts) = MockTransport::scripted(vec![]);
         let handler = TestHandler::default();
