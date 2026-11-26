@@ -26,7 +26,8 @@ actix = "0.13"
 tokio = { version = "1.42", features = ["macros", "net", "sync", "time"] }
 tokio-tungstenite = "0.30"
 native-tls = { version = "0.2", optional = true }
-rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
+# tls12: servers that do not speak TLS 1.3 yet, as with the native-tls backend.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-platform-verifier = { version = "0.7", optional = true }
 futures = "0.3"
 bytes = "1"

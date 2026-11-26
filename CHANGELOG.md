@@ -59,6 +59,8 @@ _Changes in the next release_
   `SendText` / `SendBinary` request that failed.
 
 ### Fixed
+- The rustls backend supports TLS 1.2 without the application having to enable the `tls12` feature of rustls. Before,
+  a server that does not speak TLS 1.3 failed the handshake unless another dependency happened to enable it.
 - The reconnect delay is no longer cut to whole milliseconds.
 - A header with several values keeps all of them on a redirect and on a URL refresh. Before, only the first value
   was kept.

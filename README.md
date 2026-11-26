@@ -27,6 +27,8 @@ The TLS backend for `wss://` connections is selected with cargo features:
 - With `rustls-platform-verifier` the application must install a rustls
   `CryptoProvider` at startup (e.g. `rustls::crypto::aws_lc_rs::default_provider().install_default()`);
   the crate does not choose one. Without a provider, connecting fails with `Error::Tls`.
+- Both backends support TLS 1.2 and TLS 1.3 (TLS 1.3 with `native-tls` as far as the
+  platform library does).
 - If both features are enabled (cargo feature unification), `native-tls` is used
   unless a rustls configuration is passed with `tls_connector`.
 - With `default-features = false` and no TLS feature, only plain `ws://` connections

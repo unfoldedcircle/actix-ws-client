@@ -63,6 +63,13 @@ fn validity() -> (i32, i32) {
 }
 
 async fn spawn_tls_echo_server() -> TlsServer {
+    spawn_tls_echo_server_with(rustls::DEFAULT_VERSIONS).await
+}
+
+/// A `wss://` echo server that only offers the given TLS protocol versions.
+async fn spawn_tls_echo_server_with(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> TlsServer {
     let (from_year, to_year) = validity();
 
     let ca_key = KeyPair::generate().unwrap();
@@ -87,7 +94,7 @@ async fn spawn_tls_echo_server() -> TlsServer {
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let server_config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(versions)
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(
@@ -361,4 +368,18 @@ async fn connection_dropped_by_the_server_is_reported_as_stream_ended() {
         [DisconnectReason::StreamEnded]
     );
     assert!(handler.errors.lock().unwrap().is_empty());
+}
+
+/// Many embedded devices do not speak TLS 1.3 yet.
+#[actix_rt::test]
+async fn tls12_only_server_is_supported() {
+    let server = spawn_tls_echo_server_with(&[&rustls::version::TLS12]).await;
+    let handler = RecordingHandler::default();
+    let config = config()
+        .add_root_certificate(Certificate::from_pem(server.ca_pem.clone()))
+        .build()
+        .unwrap();
+    let client = start_client(&server.url, config, handler.clone());
+
+    assert_echo(&client, &handler).await;
 }
