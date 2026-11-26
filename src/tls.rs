@@ -52,7 +52,8 @@ impl Certificate {
         Self(CertificateData::Der(der.into()))
     }
 
-    /// A PEM-encoded X.509 certificate.
+    /// PEM-encoded X.509 certificates: one, or several in a row as in a CA bundle
+    /// file. Every certificate is trusted.
     ///
     /// The encoding is validated when the connection is established.
     pub fn from_pem(pem: impl Into<Vec<u8>>) -> Self {
@@ -120,8 +121,7 @@ impl TlsContext {
 
     /// Returns the TLS connector, building it on first use.
     ///
-    /// `None` means the transport's default applies: with `native-tls`, a connector
-    /// with system CA roots and full verification. A failed build is not cached.
+    /// `None` only without a TLS backend. A failed build is not cached.
     pub(crate) fn connector(&self) -> Result<Option<Connector>, Error> {
         if let Some(connector) = self.0.connector.get() {
             return Ok(connector.clone());
@@ -147,27 +147,65 @@ fn build_connector(config: &WebSocketConfig) -> Result<Option<Connector>, Error>
 
 #[cfg(feature = "native-tls")]
 fn build_default_connector(config: &WebSocketConfig) -> Result<Option<Connector>, Error> {
-    if !config.danger_accept_invalid_certs && config.root_certificates.is_empty() {
-        return Ok(None);
-    }
+    // Built also without any option: the transport would otherwise create its default
+    // connector for every connection attempt, which loads the system CA roots again
+    // each time.
     let mut builder = native_tls::TlsConnector::builder();
     if config.danger_accept_invalid_certs {
         builder
             .danger_accept_invalid_certs(true)
             .danger_accept_invalid_hostnames(true);
     }
+    let invalid = |e| Error::Tls(format!("Invalid root certificate: {e}"));
     for certificate in &config.root_certificates {
-        let certificate = match &certificate.0 {
-            CertificateData::Der(der) => native_tls::Certificate::from_der(der),
-            CertificateData::Pem(pem) => native_tls::Certificate::from_pem(pem),
+        match &certificate.0 {
+            CertificateData::Der(der) => {
+                builder
+                    .add_root_certificate(native_tls::Certificate::from_der(der).map_err(invalid)?);
+            }
+            // native-tls reads one certificate from a PEM text.
+            CertificateData::Pem(pem) => {
+                for block in pem_certificates(pem) {
+                    builder.add_root_certificate(
+                        native_tls::Certificate::from_pem(block).map_err(invalid)?,
+                    );
+                }
+            }
         }
-        .map_err(|e| Error::Tls(format!("Invalid root certificate: {e}")))?;
-        builder.add_root_certificate(certificate);
     }
     let connector = builder
         .build()
         .map_err(|e| Error::Tls(format!("Cannot build TLS connector: {e}")))?;
     Ok(Some(Connector::NativeTls(connector)))
+}
+
+/// Splits a PEM text into its certificates, each with its `BEGIN` and `END` line.
+///
+/// A text without a complete certificate is returned as it is, so that parsing it
+/// reports the error.
+#[cfg(feature = "native-tls")]
+fn pem_certificates(pem: &[u8]) -> Vec<&[u8]> {
+    const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    const END: &[u8] = b"-----END CERTIFICATE-----";
+    let find = |from: usize, marker: &[u8]| {
+        pem[from..]
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .map(|position| from + position)
+    };
+
+    let mut certificates = Vec::new();
+    let mut position = 0;
+    while let Some(begin) = find(position, BEGIN)
+        && let Some(end) = find(begin, END)
+    {
+        position = end + END.len();
+        certificates.push(&pem[begin..position]);
+    }
+    if certificates.is_empty() {
+        certificates.push(pem);
+    }
+    certificates
 }
 
 #[cfg(all(not(feature = "native-tls"), feature = "rustls-platform-verifier"))]
@@ -187,16 +225,26 @@ fn build_default_connector(config: &WebSocketConfig) -> Result<Option<Connector>
     let verifier: Arc<dyn ServerCertVerifier> = if config.danger_accept_invalid_certs {
         Arc::new(danger::NoCertificateVerification::new(provider.clone()))
     } else {
+        let invalid = |e| Error::Tls(format!("Invalid root certificate: {e}"));
         let mut roots = Vec::with_capacity(config.root_certificates.len());
         for certificate in &config.root_certificates {
-            roots.push(match &certificate.0 {
-                CertificateData::Der(der) => CertificateDer::from(der.clone()),
-                CertificateData::Pem(pem) => CertificateDer::from_pem_slice(pem)
-                    .map_err(|e| Error::Tls(format!("Invalid root certificate: {e}")))?,
-            });
+            match &certificate.0 {
+                CertificateData::Der(der) => roots.push(CertificateDer::from(der.clone())),
+                CertificateData::Pem(pem) => {
+                    let before = roots.len();
+                    for certificate in CertificateDer::pem_slice_iter(pem) {
+                        roots.push(certificate.map_err(invalid)?);
+                    }
+                    if roots.len() == before {
+                        return Err(Error::Tls(
+                            "Invalid root certificate: no certificate in the PEM text".into(),
+                        ));
+                    }
+                }
+            }
         }
         Arc::new(
-            rustls_platform_verifier::Verifier::new_with_extra_roots(roots, provider.clone())
+            platform_verifier(roots, provider.clone())
                 .map_err(|e| Error::Tls(format!("Cannot build certificate verifier: {e}")))?,
         )
     };
@@ -208,6 +256,44 @@ fn build_default_connector(config: &WebSocketConfig) -> Result<Option<Connector>
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     Ok(Some(Connector::Rustls(Arc::new(tls_config))))
+}
+
+/// The verifier of the platform's trust store, with additional trusted roots.
+#[cfg(all(
+    not(feature = "native-tls"),
+    feature = "rustls-platform-verifier",
+    not(target_os = "android")
+))]
+fn platform_verifier(
+    roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<rustls_platform_verifier::Verifier, rustls::Error> {
+    if roots.is_empty() {
+        rustls_platform_verifier::Verifier::new(provider)
+    } else {
+        rustls_platform_verifier::Verifier::new_with_extra_roots(roots, provider)
+    }
+}
+
+/// On Android the platform verifier only knows the trust store of the system.
+#[cfg(all(
+    not(feature = "native-tls"),
+    feature = "rustls-platform-verifier",
+    target_os = "android"
+))]
+fn platform_verifier(
+    roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<rustls_platform_verifier::Verifier, rustls::Error> {
+    if !roots.is_empty() {
+        return Err(rustls::Error::General(
+            "root_certificates are not supported on Android: add the certificate to \
+             the trust store of the app, or pass a rustls configuration with \
+             tls_connector"
+                .into(),
+        ));
+    }
+    rustls_platform_verifier::Verifier::new(provider)
 }
 
 #[cfg(not(any(feature = "native-tls", feature = "rustls-platform-verifier")))]
@@ -267,5 +353,56 @@ mod danger {
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
             self.0.signature_verification_algorithms.supported_schemes()
         }
+    }
+}
+
+#[cfg(all(test, feature = "native-tls"))]
+mod tests {
+    use super::*;
+
+    const FIRST: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
+    const SECOND: &str = "-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----";
+
+    fn texts(pem: &str) -> Vec<&str> {
+        pem_certificates(pem.as_bytes())
+            .into_iter()
+            .map(|block| std::str::from_utf8(block).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn single_certificate_is_one_block() {
+        assert_eq!(texts(FIRST), [FIRST]);
+        // Text around the certificate is not part of it.
+        let commented = format!("# my CA\n{FIRST}\n\n");
+        assert_eq!(texts(&commented), [FIRST]);
+    }
+
+    #[test]
+    fn bundle_is_split_into_its_certificates() {
+        let bundle = format!("{FIRST}\n# next\n{SECOND}\n");
+        assert_eq!(texts(&bundle), [FIRST, SECOND]);
+        // Without a line break between them.
+        let joined = format!("{FIRST}{SECOND}");
+        assert_eq!(texts(&joined), [FIRST, SECOND]);
+    }
+
+    #[test]
+    fn text_without_a_complete_certificate_is_kept_for_the_parser() {
+        assert_eq!(texts("no certificate"), ["no certificate"]);
+        assert_eq!(texts(""), [""]);
+        let cut = "-----BEGIN CERTIFICATE-----\nMIIB";
+        assert_eq!(texts(cut), [cut]);
+    }
+
+    #[test]
+    fn default_connector_is_built_once_and_reused() {
+        let tls = TlsContext::new(&WebSocketConfig::builder().build().unwrap());
+        assert!(tls.connector().unwrap().is_some());
+        assert!(
+            tls.0.connector.get().is_some(),
+            "cached for the next attempt"
+        );
+        assert!(tls.connector().unwrap().is_some());
     }
 }

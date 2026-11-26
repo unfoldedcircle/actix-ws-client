@@ -290,8 +290,8 @@ const CROSS_ORIGIN_HEADERS: [HeaderName; 4] = [
 
 /// Builds the request for a redirect target.
 ///
-/// Supports absolute (`ws://`, `wss://`, `http://`, `https://`), scheme-relative
-/// (`//host/path`) and absolute-path (`/path`) Location values.
+/// The Location value is a URI reference (RFC 9110 §10.2.2): an absolute URL with a
+/// `ws`, `wss`, `http` or `https` scheme, or a reference relative to the current URL.
 ///
 /// - A redirect from `wss://` to a plain text target is refused: it would take the
 ///   connection, and on the same host also the credentials, out of TLS.
@@ -300,28 +300,12 @@ const CROSS_ORIGIN_HEADERS: [HeaderName; 4] = [
 fn build_redirect_request(current: &WsRequest, location: &str) -> Result<WsRequest, Error> {
     let current_uri = current.uri();
     let scheme = current_uri.scheme_str().unwrap_or("ws");
-    let authority = current_uri
-        .authority()
-        .map(|a| a.as_str())
-        .unwrap_or_default();
-
-    // Normalize to an absolute ws(s) URL
-    let target = if let Some(rest) = location.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else if let Some(rest) = location.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if location.starts_with("ws://") || location.starts_with("wss://") {
-        location.to_string()
-    } else if location.starts_with("//") {
-        format!("{scheme}:{location}")
-    } else if location.starts_with('/') {
-        format!("{scheme}://{authority}{location}")
-    } else {
-        return Err(Error::WebSocket(format!(
+    let target = resolve_location(current_uri, location).ok_or_else(|| {
+        Error::WebSocket(format!(
             "Unsupported redirect Location: {}",
             redact::url(location)
-        )));
-    };
+        ))
+    })?;
 
     let mut new_request = target
         .as_str()
@@ -344,6 +328,86 @@ fn build_redirect_request(current: &WsRequest, location: &str) -> Result<WsReque
     });
 
     Ok(new_request)
+}
+
+/// Resolves the Location value of a redirect against the current URL (RFC 3986 §5)
+/// and returns the absolute `ws://` or `wss://` URL of the target. `None` if the
+/// value is empty or names another protocol.
+fn resolve_location(current: &Uri, location: &str) -> Option<String> {
+    // A fragment is never sent to a server.
+    let location = location.trim().split('#').next().unwrap_or_default();
+    let scheme = current.scheme_str().unwrap_or("ws");
+    let authority = current.authority().map(|a| a.as_str()).unwrap_or_default();
+
+    // Absolute URL: `scheme:...`; schemes are not case-sensitive.
+    let scheme_end = location
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+        .filter(|end| *end > 0 && location[*end..].starts_with(':'));
+    if let Some(end) = scheme_end {
+        let rest = &location[end..];
+        return match location[..end].to_ascii_lowercase().as_str() {
+            "ws" | "http" => Some(format!("ws{rest}")),
+            "wss" | "https" => Some(format!("wss{rest}")),
+            _ => None,
+        };
+    }
+    if location.is_empty() {
+        return None;
+    }
+    // Another host with the same scheme.
+    if location.starts_with("//") {
+        return Some(format!("{scheme}:{location}"));
+    }
+    // Another path on the same host.
+    if location.starts_with('/') {
+        return Some(format!("{scheme}://{authority}{location}"));
+    }
+    // Another query for the same path.
+    if location.starts_with('?') {
+        return Some(format!(
+            "{scheme}://{authority}{}{location}",
+            current.path()
+        ));
+    }
+    // A path relative to the directory of the current path.
+    let (path, query) = match location.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (location, None),
+    };
+    let directory = current.path().rsplit_once('/').map_or("", |(dir, _)| dir);
+    let mut target = format!(
+        "{scheme}://{authority}{}",
+        remove_dot_segments(&format!("{directory}/{path}"))
+    );
+    if let Some(query) = query {
+        target.push('?');
+        target.push_str(query);
+    }
+    Some(target)
+}
+
+/// Removes the `.` and `..` segments of an absolute path (RFC 3986 §5.2.4). A `..`
+/// that would leave the root is dropped.
+fn remove_dot_segments(path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+    let mut input = path.split('/').peekable();
+    while let Some(segment) = input.next() {
+        let last = input.peek().is_none();
+        match segment {
+            "." | ".." => {
+                // The leading empty segment is the root.
+                if segment == ".." && segments.len() > 1 {
+                    segments.pop();
+                }
+                // A path that ends in a dot segment names a directory.
+                if last {
+                    segments.push("");
+                }
+            }
+            segment => segments.push(segment),
+        }
+    }
+    segments.join("/")
 }
 
 /// The origin of a WebSocket URL: scheme, host in lower case, and port — the default
@@ -531,10 +595,89 @@ mod tests {
         assert_eq!(new.uri().host(), Some("other.example.com"));
     }
 
+    /// The target of a redirect as the server may write it (RFC 9110 §10.2.2: any
+    /// URI reference).
+    fn redirect_target(current: &str, location: &str) -> String {
+        build_redirect_request(&request(current), location)
+            .unwrap()
+            .uri()
+            .to_string()
+    }
+
     #[test]
-    fn unsupported_relative_redirect_is_rejected() {
+    fn scheme_of_a_redirect_is_not_case_sensitive() {
+        let current = "ws://example.com/old";
+        assert_eq!(
+            redirect_target(current, "WS://other.example/x"),
+            "ws://other.example/x"
+        );
+        assert_eq!(
+            redirect_target(current, "WSS://other.example/x"),
+            "wss://other.example/x"
+        );
+        assert_eq!(
+            redirect_target(current, "HTTP://other.example/x"),
+            "ws://other.example/x"
+        );
+        assert_eq!(
+            redirect_target(current, "Https://other.example/x"),
+            "wss://other.example/x"
+        );
+    }
+
+    #[test]
+    fn relative_redirect_is_resolved_against_the_current_url() {
+        let current = "ws://example.com:8080/api/v1/socket?old=1";
+        assert_eq!(
+            redirect_target(current, "other"),
+            "ws://example.com:8080/api/v1/other"
+        );
+        assert_eq!(
+            redirect_target(current, "./other?x=1"),
+            "ws://example.com:8080/api/v1/other?x=1"
+        );
+        assert_eq!(
+            redirect_target(current, "../v2/socket"),
+            "ws://example.com:8080/api/v2/socket"
+        );
+        assert_eq!(
+            redirect_target(current, "../../../../socket"),
+            "ws://example.com:8080/socket"
+        );
+        assert_eq!(
+            redirect_target(current, "?token=new"),
+            "ws://example.com:8080/api/v1/socket?token=new"
+        );
+        // Without a path the base is the root.
+        assert_eq!(
+            redirect_target("ws://example.com", "other"),
+            "ws://example.com/other"
+        );
+        // A fragment is of no use for a request.
+        assert_eq!(
+            redirect_target(current, "other#section"),
+            "ws://example.com:8080/api/v1/other"
+        );
+    }
+
+    #[test]
+    fn dot_segments_are_removed() {
+        assert_eq!(remove_dot_segments("/a/b/c"), "/a/b/c");
+        assert_eq!(remove_dot_segments("/a/./b"), "/a/b");
+        assert_eq!(remove_dot_segments("/a/b/../c"), "/a/c");
+        assert_eq!(remove_dot_segments("/a/b/.."), "/a/");
+        assert_eq!(remove_dot_segments("/a/b/."), "/a/b/");
+        assert_eq!(remove_dot_segments("/../../x"), "/x");
+        assert_eq!(remove_dot_segments("/a/b/"), "/a/b/");
+        assert_eq!(remove_dot_segments("/"), "/");
+    }
+
+    #[test]
+    fn redirect_to_another_protocol_is_rejected() {
         let req = request("ws://example.com/old");
-        assert!(build_redirect_request(&req, "relative/path").is_err());
+        assert!(build_redirect_request(&req, "ftp://example.com/file").is_err());
+        assert!(build_redirect_request(&req, "mailto:someone@example.com").is_err());
+        assert!(build_redirect_request(&req, "").is_err());
     }
 
     #[test]
@@ -651,10 +794,14 @@ mod tests {
     fn redirect_error_does_not_contain_url_secrets() {
         let req = request("ws://example.com/socket");
 
-        let error = build_redirect_request(&req, "relative/path?token=token-4713").unwrap_err();
+        let error =
+            build_redirect_request(&req, "ftp://example.com/file?token=token-4713").unwrap_err();
 
         assert!(!error.to_string().contains("token-4713"), "{error}");
-        assert!(error.to_string().contains("relative/path"), "{error}");
+        assert!(
+            error.to_string().contains("ftp://example.com/file"),
+            "{error}"
+        );
     }
 
     #[test]

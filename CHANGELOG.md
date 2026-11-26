@@ -59,6 +59,11 @@ _Changes in the next release_
   `SendText` / `SendBinary` request that failed.
 
 ### Fixed
+- Every certificate of a PEM text with several certificates is trusted. Before, only the first one was used.
+- A redirect target with an uppercase scheme, or written as a relative reference (`other`, `../other`, `?query`),
+  is followed instead of rejected.
+- The rustls backend builds for Android.
+- The default native-tls connector is built once per client instead of for every connection attempt.
 - A keep-alive ping is written before the messages waiting in the send queue. Before, a backlog on a slow connection
   could delay the ping until the keep-alive timeout dropped a working connection.
 - The length of the send queue is reset after a failed write.
