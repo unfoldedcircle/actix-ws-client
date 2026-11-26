@@ -455,6 +455,10 @@ cargo test --no-default-features --features rustls-platform-verifier      # rust
 cargo test --no-default-features                                          # no TLS
 ```
 
+## Contributing
+
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to contribute and submit pull requests to us.
+
 ## Versioning
 
 We use [SemVer](http://semver.org/) for versioning. For the versions available, see the
