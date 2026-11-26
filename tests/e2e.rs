@@ -571,3 +571,52 @@ async fn stop_resolves_after_a_clean_close() {
     assert_eq!(*observed.lock().unwrap(), ["close:1000", "end"]);
     assert!(client.send(IsConnected).await.is_err());
 }
+
+/// RFC 6455 §4.1: the handshake key is a nonce, selected randomly for each connection.
+#[actix_rt::test]
+async fn every_connection_attempt_uses_a_new_handshake_key() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let log = keys.clone();
+    // Rejects every handshake and records its key.
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            if let Some(key) = request
+                .lines()
+                .find_map(|line| line.strip_prefix("sec-websocket-key:"))
+            {
+                log.lock().unwrap().push(key.trim().to_string());
+            }
+            let response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+
+    let config = WebSocketConfig::builder()
+        .initial_backoff(Duration::from_millis(10))
+        .max_backoff(Duration::from_millis(10))
+        .build()
+        .unwrap();
+    let client =
+        GenericWebSocketClient::new("e2e", url.as_str(), config, RecordingHandler::default())
+            .unwrap()
+            .start();
+    assert_eq!(
+        client.send(Connect).await.unwrap(),
+        Err(Error::Http { status: 503 })
+    );
+    wait_until(|| keys.lock().unwrap().len() >= 3, "three attempts").await;
+    client.send(Disconnect).await.unwrap();
+
+    let keys = keys.lock().unwrap();
+    let distinct: std::collections::HashSet<_> = keys.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        keys.len(),
+        "every attempt must use its own key: {keys:?}"
+    );
+}
