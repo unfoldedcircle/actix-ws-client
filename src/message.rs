@@ -119,3 +119,17 @@ impl Close {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Reconnect;
+
+/// Message sent to the [`crate::GenericWebSocketClient`] to gracefully disconnect and
+/// stop the actor.
+///
+/// The connection is closed like with [`Disconnect`], then the actor stops: its
+/// handler is dropped and further messages fail with a closed mailbox. The reply
+/// resolves once the connection is closed.
+///
+/// Dropping the last address of a client has the same effect, without a reply. Use
+/// this message to stop a client that still has other addresses, or to wait for a
+/// clean shutdown.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct Stop;

@@ -13,6 +13,7 @@ _Changes in the next release_
 - git-tag.py script for creating annotated git tag releases.
 - Dependabot for Cargo and GitHub Actions.
 - `close_timeout` option: how long a closing connection waits for the server. Default is 5 seconds.
+- `Stop` message: closes the connection and stops the actor.
 
 ### Changed
 - A connection is closed with a complete close handshake: after the close frame the client keeps reading until the
@@ -20,6 +21,9 @@ _Changes in the next release_
   disconnected right away.
 - `Disconnect` and `Close` resolve once the connection is closed, instead of at once. Use `do_send` to not wait.
 - A message that is not written when its connection ends fails with `Error::NotConnected`.
+- A client stops when its last address is dropped: it closes its connection gracefully and no longer reconnects.
+  Before, a connected or reconnecting client kept running without an address. Keep the address of a client for as
+  long as it should run.
 
 ### Fixed
 - A stalled socket is dropped when its connection ends. Before, the connection stayed open and pending `SendText` /
