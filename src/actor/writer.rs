@@ -8,6 +8,7 @@
 //! - Writes are serialized FIFO by the single-consumer channel.
 //! - Once the `Sender` is dropped, the writer writes the remaining queue (so a final
 //!   Close frame still reaches the wire) and ends.
+//! - Keep-alive pings have a channel of their own and are written first.
 //!
 //! A write waits for as long as the socket does not take the data. The connection
 //! task ends a writer that must not wait any longer by dropping it; the messages it
@@ -43,10 +44,25 @@ pub(crate) struct WriteItem {
 pub(crate) async fn run_writer(
     mut sink: BoxSink,
     mut rx: mpsc::UnboundedReceiver<WriteItem>,
+    mut pings: mpsc::UnboundedReceiver<Message>,
     queued: Arc<AtomicUsize>,
 ) -> Option<Error> {
-    while let Some(item) = rx.recv().await {
-        queued.fetch_sub(1, Ordering::Relaxed);
+    loop {
+        let item = tokio::select! {
+            biased;
+            // A keep-alive ping does not wait behind the messages of the application:
+            // with a backlog it would reach the server too late to be answered in
+            // time. It is written as soon as the message in flight is out.
+            Some(msg) = pings.recv() => WriteItem { msg, tx: None },
+            item = rx.recv() => match item {
+                Some(item) => {
+                    queued.fetch_sub(1, Ordering::Relaxed);
+                    item
+                }
+                // The sender is dropped and the queue is written.
+                None => return None,
+            },
+        };
         // `send` flushes each message, so a queued Close frame is on the wire before
         // the task ends.
         match sink.send(item.msg).await {
@@ -67,13 +83,12 @@ pub(crate) async fn run_writer(
                         let _ = tx.send(Err(Error::NotConnected));
                     }
                 }
+                queued.store(0, Ordering::Relaxed);
                 debug!("Writer ending after write failure: {error}");
                 return Some(error);
             }
         }
     }
-    // The sender is dropped and the queue is written.
-    None
 }
 
 #[cfg(test)]
@@ -83,6 +98,11 @@ mod tests {
 
     fn text(msg: &str) -> Message {
         Message::Text(msg.into())
+    }
+
+    /// No keep-alive pings: the channel is closed.
+    fn no_pings() -> mpsc::UnboundedReceiver<Message> {
+        mpsc::unbounded_channel().1
     }
 
     /// Queue counter as the actor maintains it: `n` messages were enqueued.
@@ -108,7 +128,7 @@ mod tests {
         drop(tx);
 
         let queue = queued(100);
-        assert_eq!(run_writer(sink, rx, queue.clone()).await, None);
+        assert_eq!(run_writer(sink, rx, no_pings(), queue.clone()).await, None);
         assert_eq!(queue.load(Ordering::Relaxed), 0);
 
         {
@@ -140,7 +160,7 @@ mod tests {
         }
         drop(tx);
 
-        let error = run_writer(sink, rx, queued(3)).await;
+        let error = run_writer(sink, rx, no_pings(), queued(3)).await;
         assert!(matches!(error, Some(Error::WebSocket(_))));
 
         assert_eq!(sent.lock().unwrap().len(), 1);
@@ -167,7 +187,7 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        let error = run_writer(sink, rx, queued(1)).await;
+        let error = run_writer(sink, rx, no_pings(), queued(1)).await;
 
         assert!(matches!(
             error,
@@ -177,6 +197,42 @@ mod tests {
             })
         ));
         assert!(matches!(done_rx.await.unwrap(), Err(Error::SendFailed(_))));
+    }
+
+    #[actix_rt::test]
+    async fn pings_are_written_before_queued_messages() {
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (pings_tx, pings_rx) = mpsc::unbounded_channel();
+        for i in 0..3 {
+            tx.send(WriteItem {
+                msg: text(&format!("message {i}")),
+                tx: None,
+            })
+            .unwrap();
+        }
+        pings_tx.send(Message::Ping(Default::default())).unwrap();
+        drop(tx);
+
+        assert_eq!(run_writer(sink, rx, pings_rx, queued(3)).await, None);
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 4);
+        assert!(matches!(sent[0], Message::Ping(_)));
+        assert_eq!(sent[3], text("message 2"));
+    }
+
+    /// The writer ends with the queue of the application: a ping that is still
+    /// waiting then is of no use anymore.
+    #[actix_rt::test]
+    async fn writer_ends_although_the_ping_channel_is_open() {
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (tx, rx) = mpsc::unbounded_channel::<WriteItem>();
+        let (_pings_tx, pings_rx) = mpsc::unbounded_channel();
+        drop(tx);
+
+        assert_eq!(run_writer(sink, rx, pings_rx, queued(0)).await, None);
+        assert!(sent.lock().unwrap().is_empty());
     }
 
     #[actix_rt::test]
@@ -192,7 +248,7 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        assert_eq!(run_writer(sink, rx, queued(1)).await, None);
+        assert_eq!(run_writer(sink, rx, no_pings(), queued(1)).await, None);
         assert_eq!(sent.lock().unwrap().len(), 1);
     }
 }

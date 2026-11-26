@@ -472,12 +472,23 @@ where
         self.dispatch(event, ctx);
     }
 
-    /// Enqueues a core-originated frame (ping, close) to the connection task.
+    /// Hands a core-originated frame (ping, close) to the connection task.
     fn send_core_frame(&mut self, frame: Frame) {
-        self.enqueue_write(WriteItem {
-            msg: message_from_frame(frame),
-            tx: None,
-        });
+        match frame {
+            // Written before the messages that wait in the queue.
+            Frame::Ping(payload) => {
+                if let Some(connection) = &self.connection {
+                    connection.task.ping(payload);
+                }
+            }
+            // A close frame is the last entry of the queue.
+            frame => {
+                self.enqueue_write(WriteItem {
+                    msg: message_from_frame(frame),
+                    tx: None,
+                });
+            }
+        }
     }
 
     fn teardown(&mut self, generation: u64, mode: Teardown, ctx: &mut Context<Self>) {

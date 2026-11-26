@@ -256,8 +256,9 @@ the server stops answering.
 Messages are queued while the socket cannot take them as fast as they are sent. By
 default the queue is unbounded. With `max_send_queue(n)`, at most `n` messages wait in
 the queue; a further `SendText` / `SendBinary` fails immediately with
-`Error::SendQueueFull` (a handler action is dropped with a warning). Internal control
-frames (ping, pong, close) are never rejected.
+`Error::SendQueueFull` (a handler action is dropped with a warning). Keep-alive pings
+do not use the queue: they are written before the messages that wait in it, so a
+backlog does not delay them. A close frame is never rejected.
 
 ## Logging
 
