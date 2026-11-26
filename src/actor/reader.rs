@@ -78,6 +78,45 @@ mod tests {
         );
     }
 
+    /// The server dropped the TCP connection without a close frame: its process
+    /// ended, or the device restarted. That is the end of the stream, not an error
+    /// of this client and not a protocol violation.
+    #[actix_rt::test]
+    async fn connection_dropped_by_the_server_is_a_clean_end() {
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+        let events = collect(vec![
+            Ok(Message::Text("ok".into())),
+            Err(WsError::Protocol(
+                ProtocolError::ResetWithoutClosingHandshake,
+            )),
+        ])
+        .await;
+
+        assert_eq!(
+            events,
+            vec![
+                ReaderEvent::Frame(Frame::Text("ok".into())),
+                ReaderEvent::Ended(None),
+            ]
+        );
+    }
+
+    #[actix_rt::test]
+    async fn other_protocol_errors_stay_errors() {
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+        let events = collect(vec![Err(WsError::Protocol(
+            ProtocolError::MaskedFrameFromServer,
+        ))])
+        .await;
+
+        assert!(matches!(
+            events[..],
+            [ReaderEvent::Ended(Some(Error::WebSocket(_)))]
+        ));
+    }
+
     #[actix_rt::test]
     async fn read_error_ends_the_stream_with_error() {
         let events = collect(vec![
