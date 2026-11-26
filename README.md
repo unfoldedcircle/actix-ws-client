@@ -172,7 +172,7 @@ entire lifetime. It talks to the actor over channels only and holds no address o
 |----------------------------------------------------|---------------------------------------------|
 | `Disconnect` / `Close` / `Reconnect`, actor stopped | Close handshake started by the client       |
 | Close frame of the server                          | Close handshake started by the server       |
-| Read or write error, keep-alive timeout            | Connection dropped at once                  |
+| Read or write error, keep-alive or write timeout   | Connection dropped at once                  |
 
 **Close handshake started by the client.** Messages sent before are still written,
 followed by the Close frame. The client then keeps reading — received messages are
@@ -249,6 +249,16 @@ The detection budget is exactly `max_missed_pongs * ping_interval` after the fir
 unanswered ping. A ping counts as answered when **any** frame is received after it,
 not only its pong: a peer that keeps sending data is alive. Server pings are answered
 by the transport with a matching pong.
+
+**A server that does not read.** The keep-alive notices a server that sends nothing
+anymore. It does not notice a server that keeps sending but stopped reading: every
+received frame counts as a sign of life, while the messages of the client pile up in
+the send queue. The same holds for every stalled connection of a client with
+`ping_enabled(false)`. Set `write_timeout` for these cases: if one message is not
+written to the socket within that time, the connection is dropped with
+`Error::WriteTimeout` and the client reconnects. It is off by default, because the
+right value depends on the largest message and the slowest connection of the
+application.
 
 **After a system suspend.** The timers of the client do not run while the system
 sleeps, and they do not catch up afterwards. A connection that died during the sleep
@@ -371,6 +381,7 @@ with `HandlerAction::Reconnect`.
 | `max_missed_pongs`  | 2       | Consecutive unanswered pings before reconnecting  |
 | `connect_timeout`   | 10 s    | Per-attempt connect timeout (including redirects) |
 | `close_timeout`     | 5 s     | How long a closing connection waits for the server |
+| `write_timeout`     | None    | How long writing one message may take (`None` = unlimited) |
 | `tcp_nodelay`       | true    | Disable Nagle's algorithm: send every message at once |
 | `max_redirects`     | 5       | HTTP redirects followed on connect                |
 | `connect_on_start`  | false   | Connect as soon as the actor starts               |
@@ -396,7 +407,8 @@ connects:
 
 - `backoff_factor` below 1.0, `initial_backoff` below 1 ms, `max_backoff` below
   `initial_backoff`
-- zero `connect_timeout`, `ping_interval`, `max_missed_pongs` or `max_send_queue`
+- zero `connect_timeout`, `write_timeout`, `ping_interval`, `max_missed_pongs` or
+  `max_send_queue`
 - zero `max_message_size` or `max_frame_size`, and a `max_frame_size` above
   `max_message_size`
 

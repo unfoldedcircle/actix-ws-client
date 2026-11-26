@@ -26,7 +26,7 @@ use crate::redact::{self, ActionLog, EffectLog};
 use crate::tls::TlsContext;
 use actix::fut::{ActorFutureExt, ActorStreamExt, wrap_future, wrap_stream};
 use actix::prelude::*;
-use connection::{Closed, ConnectionEvent, ConnectionHandle};
+use connection::{Closed, ConnectionEvent, ConnectionHandle, Timeouts};
 use log::{debug, info, trace, warn};
 use reader::ReaderEvent;
 use std::pin::Pin;
@@ -440,8 +440,11 @@ where
             warn!("[{}] StartConnectionTask without a transport", self.id);
             return;
         };
-        let (task, mut events) =
-            ConnectionHandle::spawn(&self.id, sink, stream, self.config.close_timeout);
+        let timeouts = Timeouts {
+            close: self.config.close_timeout,
+            write: self.config.write_timeout,
+        };
+        let (task, mut events) = ConnectionHandle::spawn(&self.id, sink, stream, timeouts);
         // Actor-owned future: cancelled via its SpawnHandle on teardown, which drops
         // the event receiver. Events are handled without a detour over the mailbox.
         let events = futures::stream::poll_fn(move |cx| events.poll_recv(cx));
@@ -2467,5 +2470,96 @@ mod tests {
             .collect();
         let expected: Vec<_> = (0..texts.len()).map(|i| format!("message {i}")).collect();
         assert_eq!(texts, expected);
+    }
+
+    // ------------------------------------------------------------------
+    // Write timeout
+    // ------------------------------------------------------------------
+
+    /// A server that keeps sending but does not read anymore: the socket takes no
+    /// data, and every received frame tells the keep-alive that the server is alive.
+    async fn client_of_a_server_that_does_not_read(
+        write_timeout: Option<Duration>,
+    ) -> (
+        Addr<GenericWebSocketClient<TestHandler>>,
+        TestHandler,
+        actix::prelude::Request<GenericWebSocketClient<TestHandler>, SendText>,
+    ) {
+        let (script, stream) = scripted_stream();
+        let (sink2, _sent2) = mock_sink(usize::MAX);
+        let (script2, stream2) = scripted_stream();
+        let (transport, _) =
+            MockTransport::scripted(vec![Ok((blocked_sink(), stream)), Ok((sink2, stream2))]);
+        let handler = TestHandler::default();
+        let mut config = WebSocketConfig::builder()
+            .ping_interval(Duration::from_secs(1))
+            .initial_backoff(Duration::from_millis(50));
+        if let Some(limit) = write_timeout {
+            config = config.write_timeout(limit);
+        }
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            "ws://localhost",
+            config.build().unwrap(),
+            handler.clone(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .start();
+        addr.send(Connect).await.unwrap().unwrap();
+
+        // The server sends an event twice a second, for as long as it is connected.
+        actix::spawn(async move {
+            while script
+                .unbounded_send(Ok(Message::Binary(Bytes::from_static(b"event"))))
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            // The second connection stays open.
+            let _script2 = script2;
+            std::future::pending::<()>().await;
+        });
+        let pending = addr.send(SendText::new("stuck"));
+        (addr, handler, pending)
+    }
+
+    #[actix_rt::test]
+    async fn write_timeout_drops_a_connection_that_takes_no_data() {
+        tokio::time::pause();
+        let limit = Duration::from_secs(10);
+        let (addr, handler, pending) = client_of_a_server_that_does_not_read(Some(limit)).await;
+
+        tokio::time::sleep(limit + Duration::from_secs(1)).await;
+
+        // The message is answered, the connection is replaced.
+        let result = tokio::time::timeout(Duration::from_millis(100), pending)
+            .await
+            .expect("the send must not hang");
+        assert!(matches!(result.unwrap(), Err(Error::SendFailed(_))));
+        assert!(handler.log_contains("error:Write timeout"));
+        assert!(handler.log_contains("closed:Error(WriteTimeout)"));
+        assert_eq!(handler.count("connected"), 2);
+        assert!(addr.send(IsConnected).await.unwrap());
+    }
+
+    /// The same server without a write timeout, as a reference: nothing ends the
+    /// connection, because the keep-alive sees a server that is alive.
+    #[actix_rt::test]
+    async fn without_a_write_timeout_a_server_that_does_not_read_is_not_noticed() {
+        tokio::time::pause();
+        let (addr, handler, pending) = client_of_a_server_that_does_not_read(None).await;
+
+        tokio::time::sleep(Duration::from_secs(600)).await;
+
+        assert_eq!(handler.count("connected"), 1);
+        assert_eq!(handler.count("disconnected"), 0);
+        assert!(addr.send(IsConnected).await.unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), pending)
+                .await
+                .is_err(),
+            "the send is still waiting"
+        );
     }
 }

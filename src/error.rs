@@ -11,6 +11,9 @@ pub enum Error {
     InvalidRequest(String),
     /// The connection attempt timed out.
     ConnectTimeout,
+    /// A message could not be written within [`crate::WebSocketConfig`]
+    /// `write_timeout`: the connection does not take data anymore.
+    WriteTimeout,
     /// The TLS configuration is invalid or the TLS handshake failed (e.g. the server
     /// certificate was rejected).
     Tls(String),
@@ -51,6 +54,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::InvalidRequest(e) => write!(f, "Invalid request: {e}"),
             Error::ConnectTimeout => write!(f, "Connection timeout"),
+            Error::WriteTimeout => write!(f, "Write timeout"),
             Error::Tls(e) => write!(f, "WebSocket error: TLS error: {e}"),
             Error::Http { status } => match StatusCode::from_u16(*status) {
                 Ok(status) => write!(f, "WebSocket error: HTTP error: {status}"),

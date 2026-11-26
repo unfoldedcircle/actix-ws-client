@@ -64,6 +64,24 @@ pub struct WebSocketConfig {
     #[builder(default = "Duration::from_secs(10)")]
     pub(crate) connect_timeout: Duration,
 
+    /// How long writing one message to the socket may take.
+    ///
+    /// A write only waits when the socket does not take the data: the network is
+    /// slower than the application sends, or the server stopped reading. If a message
+    /// is not written within this time, the connection is dropped with
+    /// [`crate::Error::WriteTimeout`] and the client reconnects.
+    ///
+    /// The keep-alive only notices a server that sends nothing anymore. A server that
+    /// keeps sending but does not read, and every stalled connection of a client with
+    /// `ping_enabled(false)`, is only noticed with a write timeout.
+    ///
+    /// The limit is for a whole message: choose it for the largest message on the
+    /// slowest connection the application has to work with. Must not be zero.
+    ///
+    /// `None` (default) does not limit a write.
+    #[builder(default)]
+    pub(crate) write_timeout: Option<Duration>,
+
     /// Whether Nagle's algorithm is disabled on the connection (`TCP_NODELAY`).
     ///
     /// The client writes every message at once. With Nagle's algorithm, a small
@@ -282,6 +300,9 @@ impl WebSocketConfigBuilder {
         {
             return Err("connect_timeout must be > 0".into());
         }
+        if self.write_timeout == Some(Some(Duration::ZERO)) {
+            return Err("write_timeout must be > 0".into());
+        }
         // A limit of zero rejects every message.
         if self.max_message_size == Some(Some(0)) {
             return Err("max_message_size must be >= 1".into());
@@ -413,6 +434,20 @@ mod tests {
         );
         // One limit alone is fine: the other one keeps the transport default.
         assert!(builder().max_message_size(1024usize).build().is_ok());
+    }
+
+    /// Every write would time out.
+    #[test]
+    fn zero_write_timeout_is_rejected() {
+        assert!(rejected(builder().write_timeout(Duration::ZERO)).contains("write_timeout"));
+
+        let config = builder()
+            .write_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        assert_eq!(config.write_timeout, Some(Duration::from_secs(10)));
+        // Not limited by default.
+        assert_eq!(builder().build().unwrap().write_timeout, None);
     }
 
     /// Not waiting for the server is a valid choice.

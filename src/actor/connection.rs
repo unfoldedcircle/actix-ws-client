@@ -48,6 +48,15 @@ pub(crate) enum ConnectionEvent {
     WriteFailed(Error),
 }
 
+/// Time limits of a connection.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Timeouts {
+    /// How long a closing connection waits for the server.
+    pub close: Duration,
+    /// How long writing one message may take; `None` does not limit it.
+    pub write: Option<Duration>,
+}
+
 /// The actor's side of a running connection task.
 pub(crate) struct ConnectionHandle {
     writes: mpsc::UnboundedSender<WriteItem>,
@@ -68,7 +77,7 @@ impl ConnectionHandle {
         id: &str,
         sink: BoxSink,
         stream: BoxStream,
-        close_timeout: Duration,
+        timeouts: Timeouts,
     ) -> (Self, mpsc::Receiver<ConnectionEvent>) {
         let (writes_tx, writes_rx) = mpsc::unbounded_channel();
         let (pings_tx, pings_rx) = mpsc::unbounded_channel();
@@ -85,7 +94,7 @@ impl ConnectionHandle {
             queued: queued.clone(),
             events: events_tx,
             shutdown: shutdown_rx,
-            close_timeout,
+            timeouts,
             _closed: closed_tx,
         }));
         let handle = Self {
@@ -157,7 +166,7 @@ struct ConnectionTask {
     queued: Arc<AtomicUsize>,
     events: mpsc::Sender<ConnectionEvent>,
     shutdown: oneshot::Receiver<Teardown>,
-    close_timeout: Duration,
+    timeouts: Timeouts,
     /// Dropped with the task: the connection is closed.
     _closed: watch::Sender<()>,
 }
@@ -173,13 +182,13 @@ async fn run_connection(task: ConnectionTask) {
         queued,
         events,
         mut shutdown,
-        close_timeout,
+        timeouts,
         _closed,
     } = task;
 
     let write_events = events.clone();
     let mut writer = Some(Box::pin(async move {
-        if let Some(error) = run_writer(sink, writes, pings, queued).await {
+        if let Some(error) = run_writer(sink, writes, pings, queued, timeouts.write).await {
             let _ = write_events.send(ConnectionEvent::WriteFailed(error)).await;
         }
     }));
@@ -219,6 +228,7 @@ async fn run_connection(task: ConnectionTask) {
 
     // Closing: keep reading until the server closed the connection. Received frames
     // are discarded, as the actor does not listen anymore.
+    let close_timeout = timeouts.close;
     let deadline = tokio::time::sleep(close_timeout);
     tokio::pin!(deadline);
     loop {
@@ -251,6 +261,10 @@ mod tests {
     use std::sync::atomic::Ordering::SeqCst;
 
     const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+    const TIMEOUTS: Timeouts = Timeouts {
+        close: CLOSE_TIMEOUT,
+        write: None,
+    };
 
     fn text(msg: &str) -> Message {
         Message::Text(msg.into())
@@ -273,7 +287,7 @@ mod tests {
     async fn writes_messages_and_reports_received_frames() {
         let (sink, sent) = mock_sink(usize::MAX);
         let (script, stream) = scripted_stream();
-        let (handle, mut events) = ConnectionHandle::spawn("test", sink, stream, CLOSE_TIMEOUT);
+        let (handle, mut events) = ConnectionHandle::spawn("test", sink, stream, TIMEOUTS);
 
         let (write, written) = item(text("out"));
         assert!(handle.enqueue(write));
@@ -303,7 +317,7 @@ mod tests {
     async fn write_failure_is_reported() {
         let (sink, _sent) = mock_sink(0);
         let (_script, stream) = scripted_stream();
-        let (handle, mut events) = ConnectionHandle::spawn("test", sink, stream, CLOSE_TIMEOUT);
+        let (handle, mut events) = ConnectionHandle::spawn("test", sink, stream, TIMEOUTS);
 
         let (write, written) = item(text("out"));
         handle.enqueue(write);
@@ -320,7 +334,7 @@ mod tests {
     async fn write_failure_empties_the_queue() {
         let (sink, _sent) = mock_sink(0);
         let (_script, stream) = scripted_stream();
-        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, CLOSE_TIMEOUT);
+        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, TIMEOUTS);
 
         let (first, first_result) = item(text("fails"));
         let (second, second_result) = item(text("queued"));
@@ -337,11 +351,32 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn write_timeout_is_reported_as_a_failed_write() {
+        tokio::time::pause();
+        let (_script, stream) = scripted_stream();
+        let timeouts = Timeouts {
+            close: CLOSE_TIMEOUT,
+            write: Some(Duration::from_secs(10)),
+        };
+        let (handle, mut events) =
+            ConnectionHandle::spawn("test", blocked_sink(), stream, timeouts);
+
+        let (write, written) = item(text("stuck"));
+        handle.enqueue(write);
+
+        assert!(matches!(written.await.unwrap(), Err(Error::SendFailed(_))));
+        assert_eq!(
+            events.recv().await,
+            Some(ConnectionEvent::WriteFailed(Error::WriteTimeout))
+        );
+    }
+
+    #[actix_rt::test]
     async fn abort_drops_a_stalled_connection_and_fails_its_messages() {
         let (sink, sink_dropped) = track_sink(blocked_sink());
         let (_script, stream) = scripted_stream();
         let (stream, stream_dropped) = track_stream(stream);
-        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, CLOSE_TIMEOUT);
+        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, TIMEOUTS);
 
         let (in_flight, in_flight_result) = item(text("in flight"));
         let (queued, queued_result) = item(text("queued"));
@@ -362,7 +397,7 @@ mod tests {
     async fn dropped_handle_aborts_the_connection() {
         let (sink, sink_dropped) = track_sink(blocked_sink());
         let (_script, stream) = scripted_stream();
-        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, CLOSE_TIMEOUT);
+        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, TIMEOUTS);
         let closed = handle.closed.clone();
 
         drop(handle);
@@ -377,7 +412,7 @@ mod tests {
         let (sink, sent) = mock_sink(usize::MAX);
         let (script, stream) = scripted_stream();
         let (stream, stream_dropped) = track_stream(stream);
-        let (handle, events) = ConnectionHandle::spawn("test", sink, stream, CLOSE_TIMEOUT);
+        let (handle, events) = ConnectionHandle::spawn("test", sink, stream, TIMEOUTS);
 
         let (write, written) = item(text("last words"));
         handle.enqueue(write);
@@ -409,7 +444,7 @@ mod tests {
         tokio::time::pause();
         let (sink, sink_dropped) = track_sink(blocked_sink());
         let (_script, stream) = scripted_stream();
-        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, CLOSE_TIMEOUT);
+        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, TIMEOUTS);
 
         let (write, written) = item(text("stuck"));
         handle.enqueue(write);
@@ -429,7 +464,15 @@ mod tests {
     async fn close_with_a_zero_timeout_still_writes_the_close_frame() {
         let (sink, sent) = mock_sink(usize::MAX);
         let (_script, stream) = scripted_stream();
-        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, Duration::ZERO);
+        let (handle, _events) = ConnectionHandle::spawn(
+            "test",
+            sink,
+            stream,
+            Timeouts {
+                close: Duration::ZERO,
+                write: None,
+            },
+        );
 
         handle.enqueue(close_item());
         handle.shut_down(Teardown::Close).wait().await;
@@ -442,7 +485,7 @@ mod tests {
         tokio::time::pause();
         let (sink, sink_dropped) = track_sink(blocked_sink());
         let (script, stream) = scripted_stream();
-        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, CLOSE_TIMEOUT);
+        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, TIMEOUTS);
 
         let (write, written) = item(text("too late"));
         handle.enqueue(write);
@@ -462,7 +505,7 @@ mod tests {
     async fn teardown_after_the_server_closed_ends_at_once() {
         let (sink, _sent) = mock_sink(usize::MAX);
         let (script, stream) = scripted_stream();
-        let (handle, mut events) = ConnectionHandle::spawn("test", sink, stream, CLOSE_TIMEOUT);
+        let (handle, mut events) = ConnectionHandle::spawn("test", sink, stream, TIMEOUTS);
 
         drop(script);
         assert_eq!(

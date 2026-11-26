@@ -10,9 +10,10 @@
 //!   Close frame still reaches the wire) and ends.
 //! - Keep-alive pings have a channel of their own and are written first.
 //!
-//! A write waits for as long as the socket does not take the data. The connection
-//! task ends a writer that must not wait any longer by dropping it; the messages it
-//! still holds are dropped with it.
+//! A write waits for as long as the socket does not take the data — at most for the
+//! write timeout, if one is configured: then the writer gives up and reports the
+//! connection as lost. The connection task ends a writer that must not wait any longer
+//! by dropping it; the messages it still holds are dropped with it.
 
 use crate::Error;
 use crate::actor::transport::BoxSink;
@@ -20,6 +21,7 @@ use futures::SinkExt;
 use log::debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -46,6 +48,7 @@ pub(crate) async fn run_writer(
     mut rx: mpsc::UnboundedReceiver<WriteItem>,
     mut pings: mpsc::UnboundedReceiver<Message>,
     queued: Arc<AtomicUsize>,
+    write_timeout: Option<Duration>,
 ) -> Option<Error> {
     loop {
         let item = tokio::select! {
@@ -65,36 +68,47 @@ pub(crate) async fn run_writer(
         };
         // `send` flushes each message, so a queued Close frame is on the wire before
         // the task ends.
-        match sink.send(item.msg).await {
-            Ok(()) => {
+        let written = match write_timeout {
+            Some(limit) => tokio::time::timeout(limit, sink.send(item.msg))
+                .await
+                .map_err(|_| limit),
+            None => Ok(sink.send(item.msg).await),
+        };
+        // The answer for the message, and the error that ends the connection.
+        let (answer, error) = match written {
+            Ok(Ok(())) => {
                 if let Some(tx) = item.tx {
                     let _ = tx.send(Ok(()));
                 }
+                continue;
             }
-            Err(e) => {
-                if let Some(tx) = item.tx {
-                    let _ = tx.send(Err(Error::SendFailed(e.to_string())));
-                }
-                let error = Error::from(e);
-                // Fail everything still queued, then report.
-                rx.close();
-                while let Ok(item) = rx.try_recv() {
-                    if let Some(tx) = item.tx {
-                        let _ = tx.send(Err(Error::NotConnected));
-                    }
-                }
-                queued.store(0, Ordering::Relaxed);
-                debug!("Writer ending after write failure: {error}");
-                return Some(error);
+            Ok(Err(e)) => (Error::SendFailed(e.to_string()), Error::from(e)),
+            // The message may be written in part: the connection is of no use anymore.
+            Err(limit) => (
+                Error::SendFailed(format!("not written within {limit:?}")),
+                Error::WriteTimeout,
+            ),
+        };
+        if let Some(tx) = item.tx {
+            let _ = tx.send(Err(answer));
+        }
+        // Fail everything still queued, then report.
+        rx.close();
+        while let Ok(item) = rx.try_recv() {
+            if let Some(tx) = item.tx {
+                let _ = tx.send(Err(Error::NotConnected));
             }
         }
+        queued.store(0, Ordering::Relaxed);
+        debug!("Writer ending after write failure: {error}");
+        return Some(error);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::testutil::{broken_pipe, failing_sink, mock_sink};
+    use crate::actor::testutil::{blocked_sink, broken_pipe, failing_sink, mock_sink, slow_sink};
 
     fn text(msg: &str) -> Message {
         Message::Text(msg.into())
@@ -128,7 +142,10 @@ mod tests {
         drop(tx);
 
         let queue = queued(100);
-        assert_eq!(run_writer(sink, rx, no_pings(), queue.clone()).await, None);
+        assert_eq!(
+            run_writer(sink, rx, no_pings(), queue.clone(), None).await,
+            None
+        );
         assert_eq!(queue.load(Ordering::Relaxed), 0);
 
         {
@@ -160,7 +177,7 @@ mod tests {
         }
         drop(tx);
 
-        let error = run_writer(sink, rx, no_pings(), queued(3)).await;
+        let error = run_writer(sink, rx, no_pings(), queued(3), None).await;
         assert!(matches!(error, Some(Error::WebSocket(_))));
 
         assert_eq!(sent.lock().unwrap().len(), 1);
@@ -187,7 +204,7 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        let error = run_writer(sink, rx, no_pings(), queued(1)).await;
+        let error = run_writer(sink, rx, no_pings(), queued(1), None).await;
 
         assert!(matches!(
             error,
@@ -214,7 +231,7 @@ mod tests {
         pings_tx.send(Message::Ping(Default::default())).unwrap();
         drop(tx);
 
-        assert_eq!(run_writer(sink, rx, pings_rx, queued(3)).await, None);
+        assert_eq!(run_writer(sink, rx, pings_rx, queued(3), None).await, None);
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 4);
@@ -231,8 +248,83 @@ mod tests {
         let (_pings_tx, pings_rx) = mpsc::unbounded_channel();
         drop(tx);
 
-        assert_eq!(run_writer(sink, rx, pings_rx, queued(0)).await, None);
+        assert_eq!(run_writer(sink, rx, pings_rx, queued(0), None).await, None);
         assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[actix_rt::test]
+    async fn write_timeout_ends_a_writer_whose_socket_takes_no_data() {
+        tokio::time::pause();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut completions = Vec::new();
+        for i in 0..2 {
+            let (done_tx, done_rx) = oneshot::channel();
+            tx.send(WriteItem {
+                msg: text(&format!("message {i}")),
+                tx: Some(done_tx),
+            })
+            .unwrap();
+            completions.push(done_rx);
+        }
+        let start = tokio::time::Instant::now();
+        let limit = Duration::from_secs(10);
+
+        // The sender stays alive: only the timeout can end the writer.
+        let queue = queued(2);
+        let error = run_writer(blocked_sink(), rx, no_pings(), queue.clone(), Some(limit)).await;
+
+        assert_eq!(error, Some(Error::WriteTimeout));
+        // Timers have a resolution of a millisecond.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= limit && elapsed < limit + Duration::from_millis(10),
+            "{elapsed:?}"
+        );
+        let stuck = completions.remove(0).await.unwrap();
+        assert!(matches!(stuck, Err(Error::SendFailed(_))), "{stuck:?}");
+        assert_eq!(
+            completions.remove(0).await.unwrap(),
+            Err(Error::NotConnected)
+        );
+        assert_eq!(queue.load(Ordering::Relaxed), 0);
+        drop(tx);
+    }
+
+    /// The limit is for one message, not for the queue.
+    #[actix_rt::test]
+    async fn write_timeout_does_not_end_a_slow_but_working_writer() {
+        tokio::time::pause();
+        let (sink, sent) = slow_sink(Duration::from_millis(800));
+        let (tx, rx) = mpsc::unbounded_channel();
+        for i in 0..5 {
+            tx.send(WriteItem {
+                msg: text(&format!("message {i}")),
+                tx: None,
+            })
+            .unwrap();
+        }
+        drop(tx);
+
+        let limit = Some(Duration::from_secs(1));
+        assert_eq!(
+            run_writer(sink, rx, no_pings(), queued(5), limit).await,
+            None
+        );
+        assert_eq!(sent.lock().unwrap().len(), 5);
+    }
+
+    /// A ping that cannot be written is a stalled connection like any other.
+    #[actix_rt::test]
+    async fn write_timeout_applies_to_a_ping() {
+        tokio::time::pause();
+        let (_tx, rx) = mpsc::unbounded_channel::<WriteItem>();
+        let (pings_tx, pings_rx) = mpsc::unbounded_channel();
+        pings_tx.send(Message::Ping(Default::default())).unwrap();
+
+        let limit = Some(Duration::from_secs(1));
+        let error = run_writer(blocked_sink(), rx, pings_rx, queued(0), limit).await;
+
+        assert_eq!(error, Some(Error::WriteTimeout));
     }
 
     #[actix_rt::test]
@@ -248,7 +340,10 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        assert_eq!(run_writer(sink, rx, no_pings(), queued(1)).await, None);
+        assert_eq!(
+            run_writer(sink, rx, no_pings(), queued(1), None).await,
+            None
+        );
         assert_eq!(sent.lock().unwrap().len(), 1);
     }
 }
