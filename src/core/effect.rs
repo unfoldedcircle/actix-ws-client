@@ -82,6 +82,9 @@ pub(crate) enum Effect {
     },
     /// Arm the reconnect timer with the given delay.
     ArmReconnectTimer {
+        /// Generation of the attempt or connection that ended: the tick of the timer
+        /// carries it back and is ignored once a newer attempt was started.
+        generation: u64,
         /// Backoff delay until the next connection attempt.
         delay: Duration,
     },

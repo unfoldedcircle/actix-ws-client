@@ -153,7 +153,7 @@ impl Machine {
                 self.on_connection_lost(generation, Some(error), now)
             }
             Event::KeepAliveTick { generation } => self.on_keepalive_tick(generation, now),
-            Event::ReconnectTimerFired => self.on_reconnect_timer(),
+            Event::ReconnectTimerFired { generation } => self.on_reconnect_timer(generation),
         }
     }
 
@@ -364,8 +364,8 @@ impl Machine {
         }
     }
 
-    fn on_reconnect_timer(&mut self) -> Vec<Effect> {
-        if self.state != ConnState::WaitingToReconnect || !self.should_reconnect {
+    fn on_reconnect_timer(&mut self, generation: u64) -> Vec<Effect> {
+        if self.state != ConnState::WaitingToReconnect || generation != self.generation {
             return Vec::new(); // cancelled or superseded timer
         }
         self.start_connect()
@@ -470,7 +470,10 @@ impl Machine {
         let jitter = (self.jitter)();
         let delay = backoff::backoff(self.reconnection_attempts, &self.cfg.backoff, jitter);
         self.state = ConnState::WaitingToReconnect;
-        effects.push(Effect::ArmReconnectTimer { delay });
+        effects.push(Effect::ArmReconnectTimer {
+            generation: self.generation,
+            delay,
+        });
     }
 }
 
@@ -527,9 +530,16 @@ mod tests {
 
     fn reconnect_delay(effects: &[Effect]) -> Option<Duration> {
         effects.iter().find_map(|e| match e {
-            Effect::ArmReconnectTimer { delay } => Some(*delay),
+            Effect::ArmReconnectTimer { delay, .. } => Some(*delay),
             _ => None,
         })
+    }
+
+    /// The tick of the reconnect timer that is armed at the moment.
+    fn timer_fired(m: &Machine) -> Event {
+        Event::ReconnectTimerFired {
+            generation: m.generation(),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -639,7 +649,7 @@ mod tests {
             },
             now,
         );
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
         m.on_event(Event::ConnectSucceeded { generation: 2 }, now);
         assert!(m.is_connected());
         assert_eq!(m.generation(), 2);
@@ -677,7 +687,7 @@ mod tests {
             },
             now,
         );
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
         m.on_event(Event::ConnectSucceeded { generation: 2 }, now);
 
         // the old reader (generation 1) finally reports end-of-stream
@@ -707,7 +717,7 @@ mod tests {
             },
             now,
         );
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
         m.on_event(Event::ConnectSucceeded { generation: 2 }, now);
 
         // cross-talk from the old connection
@@ -891,7 +901,7 @@ mod tests {
         assert_eq!(reconnect_delay(&effects), Some(INITIAL_BACKOFF));
 
         // flap again: connect, drop after 1s -> attempt 2 -> doubled
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
         m.on_event(Event::ConnectSucceeded { generation: 2 }, now);
         now += Duration::from_secs(1);
         let effects = m.on_event(
@@ -904,7 +914,7 @@ mod tests {
         assert_eq!(reconnect_delay(&effects), Some(INITIAL_BACKOFF * 2));
 
         // and again -> attempt 3 -> quadrupled
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
         m.on_event(Event::ConnectSucceeded { generation: 3 }, now);
         now += Duration::from_secs(1);
         let effects = m.on_event(
@@ -917,7 +927,7 @@ mod tests {
         assert_eq!(reconnect_delay(&effects), Some(INITIAL_BACKOFF * 4));
 
         // stable connection (>= min_stable_uptime) -> counter resets
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
         m.on_event(Event::ConnectSucceeded { generation: 4 }, now);
         now += MIN_STABLE_UPTIME;
         let effects = m.on_event(
@@ -949,7 +959,7 @@ mod tests {
             result: Err(Error::ConnectTimeout)
         }));
 
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
         let effects = m.on_event(
             Event::ConnectFailed {
                 generation: 2,
@@ -987,7 +997,7 @@ mod tests {
         }));
 
         // a racing timer tick must not restart the connection
-        let effects = m.on_event(Event::ReconnectTimerFired, now);
+        let effects = m.on_event(timer_fired(&m), now);
         assert!(effects.is_empty());
         assert_eq!(m.state(), ConnState::Disconnected);
     }
@@ -1061,7 +1071,7 @@ mod tests {
                 now,
             );
             count(&effects, &mut connected, &mut disconnected);
-            let effects = m.on_event(Event::ReconnectTimerFired, now);
+            let effects = m.on_event(timer_fired(&m), now);
             count(&effects, &mut connected, &mut disconnected);
         }
 
@@ -1327,7 +1337,7 @@ mod tests {
 
     /// The reconnect timer fires and the new connection attempt succeeds.
     fn reconnect_succeeds(m: &mut Machine, now: Instant) {
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(m), now);
         let generation = m.generation();
         m.on_event(Event::ConnectSucceeded { generation }, now);
         assert_eq!(m.state(), ConnState::Connected);
@@ -1537,12 +1547,12 @@ mod tests {
         // initial failure -> retry 1 scheduled
         let effects = fail_current_attempt(&mut m, now);
         assert!(reconnect_delay(&effects).is_some());
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
 
         // retry 1 fails -> retry 2 scheduled
         let effects = fail_current_attempt(&mut m, now);
         assert!(reconnect_delay(&effects).is_some());
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
 
         // retry 2 fails -> cap reached: exactly one exhausted signal, no timer
         let effects = fail_current_attempt(&mut m, now);
@@ -1557,7 +1567,7 @@ mod tests {
         assert_eq!(m.state(), ConnState::Disconnected);
 
         // a racing timer tick must not restart anything
-        assert!(m.on_event(Event::ReconnectTimerFired, now).is_empty());
+        assert!(m.on_event(timer_fired(&m), now).is_empty());
     }
 
     #[test]
@@ -1567,7 +1577,7 @@ mod tests {
 
         m.on_event(Event::ConnectRequested, now);
         fail_current_attempt(&mut m, now); // schedules retry 1
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
         fail_current_attempt(&mut m, now); // exhausted
         assert_eq!(m.state(), ConnState::Disconnected);
 
@@ -1597,7 +1607,7 @@ mod tests {
         // burn one attempt
         m.on_event(Event::ConnectRequested, now);
         fail_current_attempt(&mut m, now);
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
 
         // retry succeeds and stays up long enough -> counter resets
         let generation = m.generation();
@@ -1612,10 +1622,10 @@ mod tests {
         );
 
         // full budget of 2 attempts is available again
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
         let effects = fail_current_attempt(&mut m, now);
         assert!(reconnect_delay(&effects).is_some());
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
         let effects = fail_current_attempt(&mut m, now);
         assert!(
             effects.contains(&Effect::Emit(Callback::OnReconnectExhausted)),
@@ -1630,7 +1640,7 @@ mod tests {
 
         m.on_event(Event::ConnectRequested, now);
         fail_current_attempt(&mut m, now); // attempt 1
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
 
         // flapping: retry succeeds but drops before min_stable_uptime
         let generation = m.generation();
@@ -1643,7 +1653,7 @@ mod tests {
             },
             now,
         ); // attempt 2 scheduled
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
 
         // attempt 2 fails -> cap reached
         let effects = fail_current_attempt(&mut m, now);
@@ -1660,7 +1670,7 @@ mod tests {
             let effects = fail_current_attempt(&mut m, now);
             assert!(reconnect_delay(&effects).is_some());
             assert!(!effects.contains(&Effect::Emit(Callback::OnReconnectExhausted)));
-            m.on_event(Event::ReconnectTimerFired, now);
+            m.on_event(timer_fired(&m), now);
         }
     }
 
@@ -1729,7 +1739,7 @@ mod tests {
         ));
 
         // the superseded timer tick is ignored
-        assert!(m.on_event(Event::ReconnectTimerFired, now).is_empty());
+        assert!(m.on_event(timer_fired(&m), now).is_empty());
     }
 
     #[test]
@@ -1791,7 +1801,7 @@ mod tests {
         m.on_event(Event::ConnectRequested, now);
         fail_current_attempt(&mut m, now);
         // The one allowed retry is running.
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
         assert_eq!(m.state(), ConnState::Connecting);
 
         m.on_event(Event::ReconnectRequested, now);
@@ -1810,12 +1820,246 @@ mod tests {
         // grow the counter with failures
         m.on_event(Event::ConnectRequested, now);
         fail_current_attempt(&mut m, now);
-        m.on_event(Event::ReconnectTimerFired, now);
+        m.on_event(timer_fired(&m), now);
         fail_current_attempt(&mut m, now);
 
         // explicit reconnect -> fresh sequence -> next failure uses initial backoff
         m.on_event(Event::ReconnectRequested, now);
         let effects = fail_current_attempt(&mut m, now);
         assert_eq!(reconnect_delay(&effects), Some(INITIAL_BACKOFF));
+    }
+
+    // ------------------------------------------------------------------
+    // Reconnect timer generation
+    // ------------------------------------------------------------------
+
+    /// The tick of a timer that was replaced must not start the next attempt early.
+    #[test]
+    fn tick_of_a_replaced_reconnect_timer_is_ignored() {
+        let mut m = machine();
+        let now = t0();
+        m.on_event(Event::ConnectRequested, now);
+        fail_current_attempt(&mut m, now);
+        let first_timer = timer_fired(&m);
+
+        // A manual reconnect replaces the wait; its attempt fails as well.
+        m.on_event(Event::ReconnectRequested, now);
+        let effects = fail_current_attempt(&mut m, now);
+        assert!(reconnect_delay(&effects).is_some());
+        assert_eq!(m.state(), ConnState::WaitingToReconnect);
+
+        // The first timer was cancelled, but its tick is under way already.
+        assert!(m.on_event(first_timer, now).is_empty());
+        assert_eq!(m.state(), ConnState::WaitingToReconnect);
+
+        // Only the timer that is armed now starts the attempt.
+        let effects = m.on_event(timer_fired(&m), now);
+        assert!(matches!(effects[..], [Effect::StartConnect { .. }]));
+    }
+
+    #[test]
+    fn reconnect_timer_carries_the_generation_of_the_ended_attempt() {
+        let mut m = machine();
+        let now = t0();
+        m.on_event(Event::ConnectRequested, now);
+
+        let effects = fail_current_attempt(&mut m, now);
+
+        assert!(effects.contains(&Effect::ArmReconnectTimer {
+            generation: 1,
+            delay: INITIAL_BACKOFF
+        }));
+    }
+
+    // ------------------------------------------------------------------
+    // Invariants over random event sequences
+    // ------------------------------------------------------------------
+
+    /// A random event; events of a connection are tagged with the current
+    /// generation, a stale one or a future one.
+    fn random_event(rng: &mut fastrand::Rng, current: u64) -> Event {
+        let generation = match rng.u8(0..10) {
+            0 => current.saturating_sub(1),
+            1 => current + 1,
+            _ => current,
+        };
+        let error = || Error::WebSocket("random".into());
+        match rng.u8(0..16) {
+            0 | 1 => Event::ConnectRequested,
+            2 => Event::DisconnectRequested,
+            3 => Event::ReconnectRequested,
+            4 => Event::CloseRequested {
+                close: CloseInfo {
+                    code: 4000,
+                    reason: String::new(),
+                },
+                reconnect: rng.bool(),
+            },
+            5..=7 => Event::ConnectSucceeded { generation },
+            8 => Event::ConnectFailed {
+                generation,
+                error: error(),
+            },
+            9 | 10 => Event::FrameReceived {
+                generation,
+                frame: match rng.u8(0..5) {
+                    0 => Frame::Text("text".into()),
+                    1 => Frame::Binary(Bytes::from_static(b"data")),
+                    2 => Frame::Ping(Bytes::new()),
+                    3 => Frame::Pong(Bytes::new()),
+                    _ => Frame::Close(None),
+                },
+            },
+            11 => Event::StreamEnded {
+                generation,
+                error: rng.bool().then(error),
+            },
+            12 => Event::WriteFailed {
+                generation,
+                error: error(),
+            },
+            13 => Event::KeepAliveTick { generation },
+            _ => Event::ReconnectTimerFired { generation },
+        }
+    }
+
+    /// The generation of an event that belongs to a connection attempt, a connection
+    /// or a timer.
+    fn event_generation(event: &Event) -> Option<u64> {
+        match event {
+            Event::ConnectSucceeded { generation }
+            | Event::ConnectFailed { generation, .. }
+            | Event::FrameReceived { generation, .. }
+            | Event::StreamEnded { generation, .. }
+            | Event::WriteFailed { generation, .. }
+            | Event::KeepAliveTick { generation }
+            | Event::ReconnectTimerFired { generation } => Some(*generation),
+            _ => None,
+        }
+    }
+
+    /// Whatever happens in whatever order, the machine keeps its promises.
+    #[test]
+    fn invariants_hold_for_random_event_sequences() {
+        for seed in 0..2000 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let mut cfg = test_config();
+            cfg.ping_enabled = rng.bool();
+            cfg.max_reconnect_attempts = rng.bool().then(|| rng.u32(0..4));
+            let capped = cfg.max_reconnect_attempts.is_some();
+            let mut m = Machine::with_jitter(cfg, Box::new(|| 0.5));
+            let mut now = t0();
+            let mut connected = false;
+            let mut last_started = 0;
+
+            for step in 0..200 {
+                now += Duration::from_secs(rng.u64(0..45));
+                let before = (m.state(), m.generation());
+                let event = random_event(&mut rng, m.generation());
+                let context = format!("seed {seed}, step {step}, {before:?}, event {event:?}");
+                let stale = event_generation(&event).is_some_and(|g| g != before.1);
+
+                let effects = m.on_event(event, now);
+                let context = format!("{context}, effects {effects:?}");
+
+                // An event of another generation changes nothing.
+                if stale {
+                    assert!(effects.is_empty(), "{context}");
+                    assert_eq!((m.state(), m.generation()), before, "{context}");
+                }
+
+                for (index, effect) in effects.iter().enumerate() {
+                    match effect {
+                        // Generations only grow, and the attempt is the current one.
+                        Effect::StartConnect { generation, .. } => {
+                            assert!(*generation > last_started, "{context}");
+                            assert_eq!(*generation, m.generation(), "{context}");
+                            assert_eq!(m.state(), ConnState::Connecting, "{context}");
+                            last_started = *generation;
+                        }
+                        Effect::StartConnectionTask { generation }
+                        | Effect::StartKeepAlive { generation, .. } => {
+                            assert_eq!(*generation, before.1, "{context}");
+                            assert_eq!(before.0, ConnState::Connecting, "{context}");
+                        }
+                        // Only what existed before the event is torn down.
+                        Effect::TearDownConnection { generation, mode } => {
+                            assert_eq!(*generation, before.1, "{context}");
+                            // A close handshake needs its close frame, queued before.
+                            if *mode == Teardown::Close {
+                                assert!(
+                                    effects[..index].iter().any(|e| matches!(
+                                        e,
+                                        Effect::SendFrame {
+                                            frame: Frame::Close(_)
+                                        }
+                                    )),
+                                    "{context}"
+                                );
+                            }
+                        }
+                        Effect::ArmReconnectTimer { generation, .. } => {
+                            assert_eq!(*generation, m.generation(), "{context}");
+                            assert_eq!(m.state(), ConnState::WaitingToReconnect, "{context}");
+                        }
+                        // Balanced, edge-triggered callbacks.
+                        Effect::Emit(Callback::OnConnected) => {
+                            assert!(!connected, "{context}");
+                            connected = true;
+                        }
+                        Effect::Emit(Callback::OnClosed(_)) => {
+                            assert_eq!(
+                                effects.get(index + 1),
+                                Some(&Effect::Emit(Callback::OnDisconnected)),
+                                "{context}"
+                            );
+                        }
+                        Effect::Emit(Callback::OnDisconnected) => {
+                            assert!(connected, "{context}");
+                            assert!(
+                                matches!(effects[index - 1], Effect::Emit(Callback::OnClosed(_))),
+                                "{context}"
+                            );
+                            connected = false;
+                        }
+                        Effect::Emit(Callback::OnText(_) | Callback::OnBinary(_)) => {
+                            assert_eq!(before.0, ConnState::Connected, "{context}");
+                        }
+                        Effect::Emit(Callback::OnReconnectExhausted) => {
+                            assert!(capped, "{context}");
+                            assert_eq!(m.state(), ConnState::Disconnected, "{context}");
+                        }
+                        Effect::SendFrame { .. } => {
+                            assert_eq!(before.0, ConnState::Connected, "{context}");
+                        }
+                        Effect::Emit(Callback::OnError(_))
+                        | Effect::StopKeepAlive
+                        | Effect::CompleteConnect { .. } => {}
+                    }
+                }
+
+                // The callbacks tell the truth about the state.
+                assert_eq!(connected, m.is_connected(), "{context}");
+                // The machine wants a connection in every state but `Disconnected`.
+                assert_eq!(
+                    m.should_reconnect,
+                    m.state() != ConnState::Disconnected,
+                    "{context}"
+                );
+                let count = |pred: fn(&Effect) -> bool| effects.iter().filter(|e| pred(e)).count();
+                assert!(
+                    count(|e| matches!(e, Effect::StartConnect { .. })) <= 1,
+                    "{context}"
+                );
+                assert!(
+                    count(|e| matches!(e, Effect::ArmReconnectTimer { .. })) <= 1,
+                    "{context}"
+                );
+                assert!(
+                    count(|e| matches!(e, Effect::CompleteConnect { .. })) <= 1,
+                    "{context}"
+                );
+            }
+        }
     }
 }

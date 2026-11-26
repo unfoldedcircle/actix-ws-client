@@ -239,7 +239,9 @@ where
                 Effect::TearDownConnection { generation, mode } => {
                     self.teardown(generation, mode, ctx)
                 }
-                Effect::ArmReconnectTimer { delay } => self.arm_reconnect_timer(delay, ctx),
+                Effect::ArmReconnectTimer { generation, delay } => {
+                    self.arm_reconnect_timer(generation, delay, ctx)
+                }
                 Effect::StartKeepAlive {
                     generation,
                     interval,
@@ -364,7 +366,9 @@ where
             // Invalid refreshed URL: fail this attempt through the normal path, as
             // an immediately-failing connect task.
             let handle = ctx.spawn(wrap_future::<_, Self>(async {}).map(move |_, actor, ctx| {
-                actor.connect_handle = None;
+                if actor.owns_handles_of(generation) {
+                    actor.connect_handle = None;
+                }
                 actor.dispatch(Event::ConnectFailed { generation, error }, ctx);
             }));
             self.connect_handle = Some(handle);
@@ -390,7 +394,9 @@ where
         let future = self.transport.connect(self.request.clone(), options);
         let handle = ctx.spawn(
             wrap_future::<_, Self>(future).map(move |result, actor, ctx| {
-                actor.connect_handle = None;
+                if actor.owns_handles_of(generation) {
+                    actor.connect_handle = None;
+                }
                 let event = match result {
                     Ok(transport) => {
                         actor.pending_transport = Some(transport);
@@ -509,16 +515,27 @@ where
         }
     }
 
-    fn arm_reconnect_timer(&mut self, delay: Duration, ctx: &mut Context<Self>) {
+    fn arm_reconnect_timer(&mut self, generation: u64, delay: Duration, ctx: &mut Context<Self>) {
         if let Some(handle) = self.reconnect_handle.take() {
             ctx.cancel_future(handle);
         }
         info!("[{}] Reconnecting in {delay:?}", self.id);
-        let handle = ctx.run_later(delay, |actor, ctx| {
-            actor.reconnect_handle = None;
-            actor.dispatch(Event::ReconnectTimerFired, ctx);
+        let handle = ctx.run_later(delay, move |actor, ctx| {
+            if actor.owns_handles_of(generation) {
+                actor.reconnect_handle = None;
+            }
+            actor.dispatch(Event::ReconnectTimerFired { generation }, ctx);
         });
         self.reconnect_handle = Some(handle);
+    }
+
+    /// Whether the stored connect and reconnect handles belong to `generation`.
+    ///
+    /// A cancelled future can still complete once, if it was ready when it was
+    /// cancelled. The core ignores its event; this check keeps it from clearing the
+    /// handle of a newer attempt or timer, which could not be cancelled anymore.
+    fn owns_handles_of(&self, generation: u64) -> bool {
+        self.machine.generation() == generation
     }
 
     fn start_keepalive(&mut self, generation: u64, interval: Duration, ctx: &mut Context<Self>) {
