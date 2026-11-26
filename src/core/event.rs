@@ -66,21 +66,22 @@ pub(crate) enum Event {
         /// The connect error.
         error: Error,
     },
-    /// The reader task received a frame.
+    /// The connection task received a frame.
     FrameReceived {
         /// Generation of the connection the frame belongs to.
         generation: u64,
         /// The received frame.
         frame: Frame,
     },
-    /// The reader task stopped: end of stream, or a read error (connection lost).
+    /// The connection task stopped reading: end of stream, or a read error
+    /// (connection lost).
     StreamEnded {
         /// Generation of the connection.
         generation: u64,
         /// The read error, if the stream ended due to one.
         error: Option<Error>,
     },
-    /// The writer task failed to write to the sink.
+    /// The connection task failed to write to the sink.
     WriteFailed {
         /// Generation of the connection.
         generation: u64,

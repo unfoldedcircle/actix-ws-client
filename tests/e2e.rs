@@ -452,3 +452,59 @@ async fn server_ping_is_answered_with_exactly_one_pong() {
     assert_eq!(*pongs.lock().unwrap(), ["1", "2", "done"]);
     client.send(Disconnect).await.unwrap();
 }
+
+/// The transport answers the close frame of the server, with the status of the
+/// server. The client must not add a reply of its own.
+#[actix_rt::test]
+async fn server_close_is_answered_once_with_its_status() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let log = observed.clone();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        ws.close(Some(CloseFrame {
+            code: CloseCode::from(4002),
+            reason: "maintenance".into(),
+        }))
+        .await
+        .unwrap();
+        loop {
+            let entry = match ws.next().await {
+                Some(Ok(Message::Close(Some(close)))) => {
+                    format!("close:{}", u16::from(close.code))
+                }
+                Some(Ok(other)) => format!("unexpected:{other:?}"),
+                Some(Err(e)) => format!("read error: {e}"),
+                None => "end".to_string(),
+            };
+            let done = entry == "end" || entry.starts_with("read error");
+            log.lock().unwrap().push(entry);
+            if done {
+                break;
+            }
+        }
+    });
+
+    let handler = RecordingHandler::default();
+    let config = WebSocketConfig::builder()
+        .max_reconnect_attempts(0u32)
+        .build()
+        .unwrap();
+    let client = GenericWebSocketClient::new("e2e", url.as_str(), config, handler.clone())
+        .unwrap()
+        .start();
+    client.send(Connect).await.unwrap().unwrap();
+
+    wait_until(
+        || {
+            let log = observed.lock().unwrap();
+            log.iter().any(|e| e == "end" || e.contains("error"))
+        },
+        "server finished",
+    )
+    .await;
+    assert_eq!(*observed.lock().unwrap(), ["close:4002", "end"]);
+    assert!(handler.contains("closed-by-server:Some(4002):maintenance"));
+}

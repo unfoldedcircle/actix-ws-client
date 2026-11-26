@@ -1,10 +1,11 @@
 //! Actix adapter around the pure [`crate::core::Machine`].
 //!
-//! The adapter performs the I/O the core asks for — connect attempts, writer/reader
+//! The adapter performs the I/O the core asks for — connect attempts, connection
 //! tasks, timers, user callbacks — and translates real-world happenings back into core
 //! [`Event`]s. It contains **no branching policy**: every decision lives in the core,
 //! every `Handler` here is "wrap as event → `dispatch` → execute effects".
 
+pub(crate) mod connection;
 pub(crate) mod reader;
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -12,21 +13,20 @@ pub(crate) mod transport;
 pub(crate) mod writer;
 
 use crate::config::WebSocketConfig;
-use crate::core::effect::{Callback, Effect};
+use crate::core::effect::{Callback, Effect, Teardown};
 use crate::core::event::{CloseInfo, Event, Frame};
 use crate::core::{CoreConfig, Machine};
 use crate::error::Error;
 use crate::handler::{HandlerAction, TraceDirection, WebSocketMessageHandler};
 use crate::message::{Close, Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText};
 use crate::tls::TlsContext;
-use actix::fut::{ActorFutureExt, wrap_future};
+use actix::fut::{ActorFutureExt, ActorStreamExt, wrap_future, wrap_stream};
 use actix::prelude::*;
+use connection::{Closed, ConnectionEvent, ConnectionHandle};
 use log::{debug, info, trace, warn};
 use reader::ReaderEvent;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request as WsRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -40,22 +40,10 @@ use writer::WriteItem;
 /// Per-attempt URL provider, see [`GenericWebSocketClient::with_url_provider`].
 type UrlProvider = Box<dyn FnMut() -> Option<String> + Send>;
 
-// ============================================================================
-// INTERNAL MESSAGES (from detached per-connection tasks)
-// ============================================================================
-
-#[derive(Message)]
-#[rtype(result = "()")]
-struct WriteFailedMsg {
-    generation: u64,
-    error: Error,
-}
-
-#[derive(Message)]
-#[rtype(result = "()")]
-struct InboundReaderEvent {
-    generation: u64,
-    event: ReaderEvent,
+/// The established connection: its task and the actor future receiving its events.
+struct Connection {
+    task: ConnectionHandle,
+    events: SpawnHandle,
 }
 
 // ============================================================================
@@ -83,18 +71,16 @@ where
 
     // Per-connection resources, created and destroyed by effects. The active
     // connection generation is tracked by the machine.
-    writer_tx: Option<mpsc::UnboundedSender<WriteItem>>,
-    // Number of messages waiting in the writer queue of the current connection.
-    send_queue_len: Arc<AtomicUsize>,
-    reader_handle: Option<SpawnHandle>,
+    connection: Option<Connection>,
     connect_handle: Option<SpawnHandle>,
     keepalive_handle: Option<SpawnHandle>,
     reconnect_handle: Option<SpawnHandle>,
+    // Connections that were torn down and may still be closing in the background.
+    closing: Vec<Closed>,
 
     // Transport halves stashed between connect completion and the
-    // StartWriterTask/StartReaderTask effects consuming them.
-    pending_sink: Option<BoxSink>,
-    pending_stream: Option<BoxStream>,
+    // StartConnectionTask effect consuming them.
+    pending_transport: Option<(BoxSink, BoxStream)>,
     // Reply channel of an in-flight `Connect` request.
     pending_connect: Option<oneshot::Sender<Result<(), Error>>>,
     // Optional per-attempt URL refresh hook.
@@ -147,14 +133,12 @@ where
             config,
             handler,
             transport,
-            writer_tx: None,
-            send_queue_len: Arc::default(),
-            reader_handle: None,
+            connection: None,
             connect_handle: None,
             keepalive_handle: None,
             reconnect_handle: None,
-            pending_sink: None,
-            pending_stream: None,
+            closing: Vec::new(),
+            pending_transport: None,
             pending_connect: None,
             url_provider: None,
             last_msg_send_time: None,
@@ -203,10 +187,13 @@ where
                     started_connect = true;
                     self.start_connect(generation, timeout, ctx);
                 }
-                Effect::StartWriterTask { generation } => self.start_writer(generation, ctx),
-                Effect::StartReaderTask { generation } => self.start_reader(generation, ctx),
+                Effect::StartConnectionTask { generation } => {
+                    self.start_connection(generation, ctx)
+                }
                 Effect::SendFrame { frame } => self.send_core_frame(frame),
-                Effect::TearDownConnection { generation } => self.teardown(generation, ctx),
+                Effect::TearDownConnection { generation, mode } => {
+                    self.teardown(generation, mode, ctx)
+                }
                 Effect::ArmReconnectTimer { delay } => self.arm_reconnect_timer(delay, ctx),
                 Effect::StartKeepAlive {
                     generation,
@@ -283,11 +270,11 @@ where
         self.enqueue_write(WriteItem { msg, tx: None });
     }
 
-    /// Enqueues a message to the writer task, tracing outbound text messages when
-    /// enabled. Returns false if there is no writer.
+    /// Enqueues a message to the connection task, tracing outbound text messages when
+    /// enabled. Returns false if there is no connection.
     fn enqueue_write(&mut self, item: WriteItem) -> bool {
-        let Some(writer_tx) = &self.writer_tx else {
-            trace!("[{}] No writer, dropping outbound frame", self.id);
+        let Some(connection) = &self.connection else {
+            trace!("[{}] No connection, dropping outbound frame", self.id);
             return false;
         };
         if self.config.msg_tracing_out
@@ -302,18 +289,16 @@ where
             debug!("[{}] {:4} <- {text}", self.id, elapsed.as_millis());
             self.last_msg_send_time = Some(Instant::now());
         }
-        let enqueued = writer_tx.send(item).is_ok();
-        if enqueued {
-            self.send_queue_len.fetch_add(1, Ordering::Relaxed);
-        }
-        enqueued
+        connection.task.enqueue(item)
     }
 
-    /// Whether the writer queue reached the configured `max_send_queue`.
+    /// Whether the write queue reached the configured `max_send_queue`.
     fn send_queue_full(&self) -> bool {
-        self.config
-            .max_send_queue
-            .is_some_and(|max| self.send_queue_len.load(Ordering::Relaxed) >= max)
+        let queued = self
+            .connection
+            .as_ref()
+            .map_or(0, |connection| connection.task.queue_len());
+        self.config.max_send_queue.is_some_and(|max| queued >= max)
     }
 
     fn start_connect(&mut self, generation: u64, timeout: Duration, ctx: &mut Context<Self>) {
@@ -354,9 +339,8 @@ where
             wrap_future::<_, Self>(future).map(move |result, actor, ctx| {
                 actor.connect_handle = None;
                 let event = match result {
-                    Ok((sink, stream)) => {
-                        actor.pending_sink = Some(sink);
-                        actor.pending_stream = Some(stream);
+                    Ok(transport) => {
+                        actor.pending_transport = Some(transport);
                         Event::ConnectSucceeded { generation }
                     }
                     Err(error) => Event::ConnectFailed { generation, error },
@@ -364,8 +348,7 @@ where
                 actor.dispatch(event, ctx);
                 // Drop unclaimed halves if the core ignored the result
                 // (stale generation or cancelled attempt).
-                actor.pending_sink = None;
-                actor.pending_stream = None;
+                actor.pending_transport = None;
             }),
         );
         self.connect_handle = Some(handle);
@@ -398,42 +381,45 @@ where
         Ok(())
     }
 
-    fn start_writer(&mut self, generation: u64, ctx: &mut Context<Self>) {
-        let Some(sink) = self.pending_sink.take() else {
-            warn!("[{}] StartWriterTask without a pending sink", self.id);
+    /// Starts the connection task and the actor future receiving its events.
+    fn start_connection(&mut self, generation: u64, ctx: &mut Context<Self>) {
+        let Some((sink, stream)) = self.pending_transport.take() else {
+            warn!("[{}] StartConnectionTask without a transport", self.id);
             return;
         };
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.writer_tx = Some(tx);
-        let queued = Arc::new(AtomicUsize::new(0));
-        self.send_queue_len = queued.clone();
-        let addr = ctx.address();
-        // Detached task (not tied to the actor context): on teardown it must outlive
-        // the actor's handler to drain the queue, e.g. flush a final Close frame.
-        actix::spawn(async move {
-            if let Some(error) = writer::run_writer(sink, rx, queued).await {
-                addr.do_send(WriteFailedMsg { generation, error });
+        let (task, mut events) =
+            ConnectionHandle::spawn(&self.id, sink, stream, self.config.close_timeout);
+        // Actor-owned future: cancelled via its SpawnHandle on teardown, which drops
+        // the event receiver. Events are handled without a detour over the mailbox.
+        let events = futures::stream::poll_fn(move |cx| events.poll_recv(cx));
+        let events = ctx.spawn(
+            wrap_stream::<_, Self>(events)
+                .map(move |event, actor, ctx| actor.on_connection_event(generation, event, ctx))
+                .finish(),
+        );
+        self.connection = Some(Connection { task, events });
+    }
+
+    /// Feeds an event of the connection task into the core.
+    fn on_connection_event(
+        &mut self,
+        generation: u64,
+        event: ConnectionEvent,
+        ctx: &mut Context<Self>,
+    ) {
+        let event = match event {
+            ConnectionEvent::Read(ReaderEvent::Frame(frame)) => {
+                Event::FrameReceived { generation, frame }
             }
-        });
-    }
-
-    fn start_reader(&mut self, generation: u64, ctx: &mut Context<Self>) {
-        let Some(stream) = self.pending_stream.take() else {
-            warn!("[{}] StartReaderTask without a pending stream", self.id);
-            return;
+            ConnectionEvent::Read(ReaderEvent::Ended(error)) => {
+                Event::StreamEnded { generation, error }
+            }
+            ConnectionEvent::WriteFailed(error) => Event::WriteFailed { generation, error },
         };
-        let addr = ctx.address();
-        // Actor-owned future: cancelled via its SpawnHandle on teardown.
-        let handle = ctx.spawn(wrap_future::<_, Self>(async move {
-            reader::run_reader(stream, |event| {
-                addr.do_send(InboundReaderEvent { generation, event });
-            })
-            .await;
-        }));
-        self.reader_handle = Some(handle);
+        self.dispatch(event, ctx);
     }
 
-    /// Enqueues a core-originated frame (ping, pong reply, close) to the writer.
+    /// Enqueues a core-originated frame (ping, close) to the connection task.
     fn send_core_frame(&mut self, frame: Frame) {
         self.enqueue_write(WriteItem {
             msg: message_from_frame(frame),
@@ -441,12 +427,17 @@ where
         });
     }
 
-    fn teardown(&mut self, generation: u64, ctx: &mut Context<Self>) {
-        debug!("[{}] Tearing down connection (#{generation})", self.id);
-        // Dropping the sender ends the writer task after it drained its queue.
-        self.writer_tx = None;
-        if let Some(handle) = self.reader_handle.take() {
-            ctx.cancel_future(handle);
+    fn teardown(&mut self, generation: u64, mode: Teardown, ctx: &mut Context<Self>) {
+        debug!(
+            "[{}] Tearing down connection (#{generation}, {mode:?})",
+            self.id
+        );
+        if let Some(connection) = self.connection.take() {
+            // Stop listening: events of this connection are of no interest anymore.
+            ctx.cancel_future(connection.events);
+            // The task finishes the connection on its own, see `Teardown`.
+            self.closing.retain(|closed| !closed.is_closed());
+            self.closing.push(connection.task.shut_down(mode));
         }
         if let Some(handle) = self.connect_handle.take() {
             ctx.cancel_future(handle);
@@ -457,8 +448,18 @@ where
         if let Some(handle) = self.reconnect_handle.take() {
             ctx.cancel_future(handle);
         }
-        self.pending_sink = None;
-        self.pending_stream = None;
+        self.pending_transport = None;
+    }
+
+    /// Resolves once every connection that was torn down so far is closed.
+    fn closed(&mut self) -> impl Future<Output = ()> + use<H> {
+        self.closing.retain(|closed| !closed.is_closed());
+        let closing = self.closing.clone();
+        async move {
+            for closed in closing {
+                closed.wait().await;
+            }
+        }
     }
 
     fn arm_reconnect_timer(&mut self, delay: Duration, ctx: &mut Context<Self>) {
@@ -530,7 +531,7 @@ where
         }
     }
 
-    /// Common implementation for `SendText` / `SendBinary`: enqueue to the writer
+    /// Common implementation for `SendText` / `SendBinary`: enqueue to the connection
     /// task, never awaiting in the handler. Returns `NotConnected` immediately when
     /// there is no active connection, and `SendQueueFull` when the queue limit is
     /// reached.
@@ -548,9 +549,8 @@ where
         Box::pin(async move {
             match rx.await {
                 Ok(result) => result,
-                Err(_) => Err(Error::SendFailed(
-                    "Internal actor communication error".to_string(),
-                )),
+                // The connection ended before the message was written.
+                Err(_) => Err(Error::NotConnected),
             }
         })
     }
@@ -610,19 +610,22 @@ impl<H: WebSocketMessageHandler> Handler<Connect> for GenericWebSocketClient<H> 
 }
 
 impl<H: WebSocketMessageHandler> Handler<Disconnect> for GenericWebSocketClient<H> {
-    type Result = ();
+    type Result = ResponseFuture<()>;
 
-    fn handle(&mut self, _msg: Disconnect, ctx: &mut Context<Self>) {
+    fn handle(&mut self, _msg: Disconnect, ctx: &mut Context<Self>) -> Self::Result {
         debug!("[{}] Explicit disconnect requested", self.id);
         self.dispatch(Event::DisconnectRequested, ctx);
+        Box::pin(self.closed())
     }
 }
 
 impl<H: WebSocketMessageHandler> Handler<Close> for GenericWebSocketClient<H> {
-    type Result = Result<(), Error>;
+    type Result = ResponseFuture<Result<(), Error>>;
 
     fn handle(&mut self, msg: Close, ctx: &mut Context<Self>) -> Self::Result {
-        validate_close(msg.code, &msg.reason)?;
+        if let Err(error) = validate_close(msg.code, &msg.reason) {
+            return Box::pin(async { Err(error) });
+        }
         debug!(
             "[{}] Explicit disconnect requested (close code {})",
             self.id, msg.code
@@ -637,7 +640,11 @@ impl<H: WebSocketMessageHandler> Handler<Close> for GenericWebSocketClient<H> {
             },
             ctx,
         );
-        Ok(())
+        let closed = self.closed();
+        Box::pin(async move {
+            closed.await;
+            Ok(())
+        })
     }
 }
 
@@ -666,38 +673,6 @@ impl<H: WebSocketMessageHandler> Handler<SendBinary> for GenericWebSocketClient<
     }
 }
 
-impl<H: WebSocketMessageHandler> Handler<InboundReaderEvent> for GenericWebSocketClient<H> {
-    type Result = ();
-
-    fn handle(&mut self, msg: InboundReaderEvent, ctx: &mut Context<Self>) {
-        let event = match msg.event {
-            ReaderEvent::Frame(frame) => Event::FrameReceived {
-                generation: msg.generation,
-                frame,
-            },
-            ReaderEvent::Ended(error) => Event::StreamEnded {
-                generation: msg.generation,
-                error,
-            },
-        };
-        self.dispatch(event, ctx);
-    }
-}
-
-impl<H: WebSocketMessageHandler> Handler<WriteFailedMsg> for GenericWebSocketClient<H> {
-    type Result = ();
-
-    fn handle(&mut self, msg: WriteFailedMsg, ctx: &mut Context<Self>) {
-        self.dispatch(
-            Event::WriteFailed {
-                generation: msg.generation,
-                error: msg.error,
-            },
-            ctx,
-        );
-    }
-}
-
 // ============================================================================
 // INTEGRATION TESTS (mock transport, no TCP)
 // ============================================================================
@@ -710,8 +685,8 @@ mod tests {
     use super::*;
     use crate::{DisconnectReason, WebSocketConfig};
     use bytes::Bytes;
-    use std::sync::Mutex;
     use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::{Arc, Mutex};
     use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
@@ -1036,7 +1011,8 @@ mod tests {
         let addr = client(transport, handler.clone());
 
         addr.send(Connect).await.unwrap().unwrap();
-        addr.send(Disconnect).await.unwrap();
+        // Not awaited: the mock server never answers the close frame.
+        addr.do_send(Disconnect);
 
         wait_until(
             || sent_contains(&sent, |m| matches!(m, Message::Close(_))),
@@ -1063,10 +1039,8 @@ mod tests {
         let addr = client(transport, handler.clone());
         addr.send(Connect).await.unwrap().unwrap();
 
-        addr.send(Close::new(4000, "going to standby"))
-            .await
-            .unwrap()
-            .unwrap();
+        // Not awaited: the mock server never answers the close frame.
+        addr.do_send(Close::new(4000, "going to standby"));
 
         wait_until(
             || sent_close(&sent, 4000, "going to standby"),
@@ -1136,10 +1110,8 @@ mod tests {
         let addr = client(transport, handler.clone());
         addr.send(Connect).await.unwrap().unwrap();
 
-        addr.send(Close::new(1002, "unexpected message").with_reconnect())
-            .await
-            .unwrap()
-            .unwrap();
+        // Not awaited: the mock server never answers the close frame.
+        addr.do_send(Close::new(1002, "unexpected message").with_reconnect());
 
         wait_until(
             || sent_close(&sent1, 1002, "unexpected message"),
@@ -1205,31 +1177,6 @@ mod tests {
             })
             .expect("close reason reported");
         assert_eq!(log[closed + 1], "disconnected");
-    }
-
-    #[actix_rt::test]
-    async fn server_ping_is_answered_with_pong() {
-        let (sink, sent) = mock_sink(usize::MAX);
-        let (script, stream) = scripted_stream();
-        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
-        let addr = client(transport, TestHandler::default());
-
-        addr.send(Connect).await.unwrap().unwrap();
-        script
-            .unbounded_send(Ok(Message::Ping(Bytes::from_static(b"probe"))))
-            .unwrap();
-
-        wait_until(
-            || {
-                sent_contains(
-                    &sent,
-                    |m| matches!(m, Message::Pong(p) if p.as_ref() == b"probe"),
-                )
-            },
-            "pong reply",
-        )
-        .await;
-        assert!(addr.send(IsConnected).await.unwrap());
     }
 
     #[actix_rt::test]

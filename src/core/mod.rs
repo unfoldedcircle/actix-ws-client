@@ -31,7 +31,7 @@ use crate::Error;
 use crate::handler::DisconnectReason;
 use backoff::BackoffCfg;
 use bytes::Bytes;
-use effect::{Callback, Effect};
+use effect::{Callback, Effect, Teardown};
 use event::{CloseInfo, Event, Frame};
 use keepalive::{KeepAlive, KeepAliveOutcome};
 use state::ConnState;
@@ -190,6 +190,7 @@ impl Machine {
                 vec![
                     Effect::TearDownConnection {
                         generation: self.generation,
+                        mode: Teardown::Abort,
                     },
                     Effect::CompleteConnect {
                         result: Err(Error::StateChanged),
@@ -201,6 +202,7 @@ impl Machine {
                 // Teardown cancels the armed reconnect timer.
                 vec![Effect::TearDownConnection {
                     generation: self.generation,
+                    mode: Teardown::Abort,
                 }]
             }
             ConnState::Disconnected => Vec::new(),
@@ -255,10 +257,7 @@ impl Machine {
         self.connected_at = Some(now);
         self.keepalive.reset();
         self.signalled_connected = true;
-        let mut effects = vec![
-            Effect::StartWriterTask { generation },
-            Effect::StartReaderTask { generation },
-        ];
+        let mut effects = vec![Effect::StartConnectionTask { generation }];
         if self.cfg.ping_enabled {
             effects.push(Effect::StartKeepAlive {
                 generation,
@@ -291,24 +290,20 @@ impl Machine {
         match frame {
             Frame::Text(text) => vec![Effect::Emit(Callback::OnText(text))],
             Frame::Binary(data) => vec![Effect::Emit(Callback::OnBinary(data))],
-            // Answer server pings promptly: with a split sink/stream, the transport's
-            // automatic pong is only flushed on our next write, which may be up to a
-            // ping interval away.
-            Frame::Ping(payload) => vec![Effect::SendFrame {
-                frame: Frame::Pong(payload),
-            }],
-            Frame::Pong(_) => Vec::new(),
+            // The transport answers a server ping itself: the pong is written with
+            // the next read of the connection task, which follows at once.
+            Frame::Ping(_) | Frame::Pong(_) => Vec::new(),
             Frame::Close(close) => {
-                // Reply to the peer's close handshake, then tear down.
-                let mut effects = vec![Effect::SendFrame {
-                    frame: Frame::Close(None),
-                }];
+                // The transport answers the close frame itself, echoing the status
+                // of the server. Nothing can be sent anymore.
                 let (code, reason) = match close {
                     Some(close) => (Some(close.code), close.reason),
                     None => (None, String::new()),
                 };
-                effects.extend(
-                    self.leave_connected(now, DisconnectReason::ClosedByServer { code, reason }),
+                let mut effects = self.leave_connected(
+                    now,
+                    DisconnectReason::ClosedByServer { code, reason },
+                    Teardown::PeerClosed,
                 );
                 self.schedule_reconnect_or_idle(&mut effects);
                 effects
@@ -333,7 +328,8 @@ impl Machine {
             }
             None => DisconnectReason::StreamEnded,
         };
-        effects.extend(self.leave_connected(now, reason));
+        // The connection is broken: there is nobody to complete a close handshake with.
+        effects.extend(self.leave_connected(now, reason, Teardown::Abort));
         self.schedule_reconnect_or_idle(&mut effects);
         effects
     }
@@ -349,7 +345,8 @@ impl Machine {
             KeepAliveOutcome::Reconnect => {
                 // RFC 6455 §7.1.7 "Fail the WebSocket Connection": the peer is
                 // unresponsive, so drop the connection without a Close handshake.
-                let mut effects = self.leave_connected(now, DisconnectReason::KeepAliveTimeout);
+                let mut effects =
+                    self.leave_connected(now, DisconnectReason::KeepAliveTimeout, Teardown::Abort);
                 self.schedule_reconnect_or_idle(&mut effects);
                 effects
             }
@@ -368,8 +365,9 @@ impl Machine {
     // ========================================================================
 
     /// Graceful close of an established connection: enqueue the Close frame first,
-    /// then drop the writer sender (the writer task drains its queue before
-    /// terminating, so the Close frame is still sent).
+    /// then hand the connection over to its close handshake. The connection task
+    /// writes its queue including the Close frame and waits for the server to close,
+    /// while the machine moves on right away.
     ///
     /// The caller decides the next state.
     fn close_connected(&mut self, close: Option<CloseInfo>) -> Vec<Effect> {
@@ -380,6 +378,7 @@ impl Machine {
             },
             Effect::TearDownConnection {
                 generation: self.generation,
+                mode: Teardown::Close,
             },
         ];
         effects.extend(self.emit_disconnected_edge(DisconnectReason::ClosedLocally));
@@ -400,8 +399,14 @@ impl Machine {
 
     /// Common teardown when leaving `Connected`: resets the backoff counter if the
     /// connection was stable long enough (flapping protection), stops keep-alive,
-    /// tears down connection resources and emits a balanced `OnDisconnected`.
-    fn leave_connected(&mut self, now: Instant, reason: DisconnectReason) -> Vec<Effect> {
+    /// tears down connection resources as given by `mode` and emits a balanced
+    /// `OnDisconnected`.
+    fn leave_connected(
+        &mut self,
+        now: Instant,
+        reason: DisconnectReason,
+        mode: Teardown,
+    ) -> Vec<Effect> {
         if let Some(connected_at) = self.connected_at
             && now.duration_since(connected_at) >= self.cfg.min_stable_uptime
         {
@@ -413,6 +418,7 @@ impl Machine {
             Effect::StopKeepAlive,
             Effect::TearDownConnection {
                 generation: self.generation,
+                mode,
             },
         ];
         effects.extend(self.emit_disconnected_edge(reason));
@@ -538,8 +544,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![
-                Effect::StartWriterTask { generation: 1 },
-                Effect::StartReaderTask { generation: 1 },
+                Effect::StartConnectionTask { generation: 1 },
                 Effect::StartKeepAlive {
                     generation: 1,
                     interval: PING_INTERVAL
@@ -752,7 +757,10 @@ mod tests {
         // tick 3: 2 missed pongs (== max) -> drop and reconnect
         let effects = m.on_event(Event::KeepAliveTick { generation }, now);
         assert_eq!(m.state(), ConnState::WaitingToReconnect);
-        assert!(effects.contains(&Effect::TearDownConnection { generation }));
+        assert!(effects.contains(&Effect::TearDownConnection {
+            generation,
+            mode: Teardown::Abort
+        }));
         assert!(reconnect_delay(&effects).is_some());
         // decision: keep-alive failure drops the connection, no Close handshake
         assert!(
@@ -805,8 +813,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![
-                Effect::StartWriterTask { generation },
-                Effect::StartReaderTask { generation },
+                Effect::StartConnectionTask { generation },
                 Effect::Emit(Callback::OnConnected),
                 Effect::CompleteConnect { result: Ok(()) },
             ]
@@ -952,7 +959,10 @@ mod tests {
 
         let effects = m.on_event(Event::DisconnectRequested, now);
         assert_eq!(m.state(), ConnState::Disconnected);
-        assert!(effects.contains(&Effect::TearDownConnection { generation: 1 }));
+        assert!(effects.contains(&Effect::TearDownConnection {
+            generation: 1,
+            mode: Teardown::Abort
+        }));
 
         // a racing timer tick must not restart the connection
         let effects = m.on_event(Event::ReconnectTimerFired, now);
@@ -1058,30 +1068,28 @@ mod tests {
     // Frame handling details
     // ------------------------------------------------------------------
 
+    /// The transport answers a server ping itself: a second pong must not be sent.
     #[test]
-    fn server_ping_is_answered_with_pong_carrying_the_payload() {
+    fn server_ping_is_left_to_the_transport() {
         let mut m = machine();
         let now = t0();
         let generation = connect(&mut m, now);
 
-        let payload = Bytes::from_static(b"app-data");
         let effects = m.on_event(
             Event::FrameReceived {
                 generation,
-                frame: Frame::Ping(payload.clone()),
+                frame: Frame::Ping(Bytes::from_static(b"app-data")),
             },
             now,
         );
-        assert_eq!(
-            effects,
-            vec![Effect::SendFrame {
-                frame: Frame::Pong(payload)
-            }]
-        );
+        assert!(effects.is_empty());
+        assert!(m.is_connected());
     }
 
+    /// The transport answers the close frame of the server itself. Sending a reply
+    /// of our own is rejected by the transport, as the connection is closing.
     #[test]
-    fn peer_close_is_answered_and_reconnects() {
+    fn peer_close_waits_for_the_server_and_reconnects() {
         let mut m = machine();
         let now = t0();
         let generation = connect(&mut m, now);
@@ -1093,16 +1101,38 @@ mod tests {
             },
             now,
         );
-        // close reply is enqueued before the writer is torn down
-        assert_eq!(
-            effects[0],
-            Effect::SendFrame {
-                frame: Frame::Close(None)
-            }
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendFrame { .. })),
+            "no frame can be sent after the close frame of the server"
         );
-        assert!(effects.contains(&Effect::TearDownConnection { generation }));
+        assert!(effects.contains(&Effect::TearDownConnection {
+            generation,
+            mode: Teardown::PeerClosed
+        }));
         assert!(reconnect_delay(&effects).is_some());
         assert_eq!(m.state(), ConnState::WaitingToReconnect);
+    }
+
+    /// A broken connection is dropped at once, without a close handshake.
+    #[test]
+    fn lost_connection_is_aborted() {
+        let mut m = machine();
+        let now = t0();
+        let generation = connect(&mut m, now);
+
+        let effects = m.on_event(
+            Event::StreamEnded {
+                generation,
+                error: None,
+            },
+            now,
+        );
+        assert!(effects.contains(&Effect::TearDownConnection {
+            generation,
+            mode: Teardown::Abort
+        }));
     }
 
     #[test]
@@ -1120,7 +1150,10 @@ mod tests {
             now,
         );
         assert!(effects.contains(&Effect::Emit(Callback::OnError(error))));
-        assert!(effects.contains(&Effect::TearDownConnection { generation }));
+        assert!(effects.contains(&Effect::TearDownConnection {
+            generation,
+            mode: Teardown::Abort
+        }));
         assert_eq!(m.state(), ConnState::WaitingToReconnect);
     }
 
@@ -1415,11 +1448,16 @@ mod tests {
             .expect("close frame must be sent");
         let teardown_pos = effects
             .iter()
-            .position(|e| *e == Effect::TearDownConnection { generation })
-            .expect("teardown must happen");
+            .position(|e| {
+                *e == Effect::TearDownConnection {
+                    generation,
+                    mode: Teardown::Close,
+                }
+            })
+            .expect("teardown with a close handshake must happen");
         assert!(
             close_pos < teardown_pos,
-            "close must be enqueued before the writer is dropped"
+            "close must be enqueued before the connection is handed over"
         );
         assert_eq!(count_disconnected(&effects), 1);
         assert_eq!(m.state(), ConnState::Disconnected);
@@ -1630,7 +1668,12 @@ mod tests {
             .expect("close frame");
         let teardown_pos = effects
             .iter()
-            .position(|e| *e == Effect::TearDownConnection { generation })
+            .position(|e| {
+                *e == Effect::TearDownConnection {
+                    generation,
+                    mode: Teardown::Close,
+                }
+            })
             .expect("teardown");
         assert!(close_pos < teardown_pos);
         assert_eq!(count_disconnected(&effects), 1);

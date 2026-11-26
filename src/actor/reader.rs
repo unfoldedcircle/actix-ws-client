@@ -1,17 +1,14 @@
-//! Per-connection reader task.
+//! Read side of the connection task, see [`crate::actor::connection`].
 //!
-//! The task owns the `Stream` half of the connection and forwards each received frame
-//! to the actor, tagged with the connection generation by the caller. There is no
-//! `ctx.add_stream` (P0-2): the task's lifecycle is fully owned — the actor cancels it
-//! via its `SpawnHandle` on teardown, and a late end-of-stream from a previous
-//! connection is ignored by the core's generation check.
+//! The reader owns the `Stream` half of the connection and forwards each received
+//! frame. Forwarding is awaited: a consumer that is not ready slows down reading.
 
 use crate::Error;
 use crate::actor::transport::{BoxStream, frame_from_message};
 use crate::core::event::Frame;
 use futures::StreamExt;
 
-/// Output of the reader task, forwarded to the actor.
+/// Output of the reader, forwarded to the actor.
 #[derive(Debug, PartialEq)]
 pub(crate) enum ReaderEvent {
     /// A frame was received.
@@ -25,22 +22,22 @@ pub(crate) enum ReaderEvent {
 /// The final event is always [`ReaderEvent::Ended`].
 pub(crate) async fn run_reader<F>(mut stream: BoxStream, mut forward: F)
 where
-    F: FnMut(ReaderEvent),
+    F: AsyncFnMut(ReaderEvent),
 {
     while let Some(item) = stream.next().await {
         match item {
             Ok(msg) => {
                 if let Some(frame) = frame_from_message(msg) {
-                    forward(ReaderEvent::Frame(frame));
+                    forward(ReaderEvent::Frame(frame)).await;
                 }
             }
             Err(e) => {
-                forward(ReaderEvent::Ended(Some(Error::from(e))));
+                forward(ReaderEvent::Ended(Some(Error::from(e)))).await;
                 return;
             }
         }
     }
-    forward(ReaderEvent::Ended(None));
+    forward(ReaderEvent::Ended(None)).await;
 }
 
 #[cfg(test)]
@@ -53,7 +50,7 @@ mod tests {
     async fn collect(items: Vec<Result<Message, WsError>>) -> Vec<ReaderEvent> {
         let stream: BoxStream = Box::pin(futures::stream::iter(items));
         let mut events = Vec::new();
-        run_reader(stream, |ev| events.push(ev)).await;
+        run_reader(stream, async |ev| events.push(ev)).await;
         events
     }
 
