@@ -7,6 +7,7 @@
 
 pub(crate) mod connection;
 pub(crate) mod reader;
+pub(crate) mod tcp;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub(crate) mod transport;
@@ -366,6 +367,7 @@ where
             timeout,
             max_redirects: self.config.max_redirects,
             ws_config,
+            tcp_nodelay: self.config.tcp_nodelay,
             tls: self.tls.clone(),
         };
         let future = self.transport.connect(self.request.clone(), options);

@@ -620,3 +620,18 @@ async fn every_connection_attempt_uses_a_new_handshake_key() {
         "every attempt must use its own key: {keys:?}"
     );
 }
+
+/// `localhost` resolves to an IPv6 and an IPv4 address on most systems, the server
+/// listens on IPv4 only.
+#[actix_rt::test]
+async fn connects_to_a_host_name_with_several_addresses() {
+    let url = spawn_echo_server().await;
+    let url = url.replace("127.0.0.1", "localhost");
+    let handler = RecordingHandler::default();
+    let client = start_client(&url, handler.clone());
+
+    client.send(Connect).await.unwrap().unwrap();
+    client.send(SendText::new("hello")).await.unwrap().unwrap();
+    wait_until(|| handler.contains("text:hello"), "text echo").await;
+    client.send(Disconnect).await.unwrap();
+}

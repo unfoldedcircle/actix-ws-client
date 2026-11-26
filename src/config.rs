@@ -59,6 +59,17 @@ pub struct WebSocketConfig {
     #[builder(default = "Duration::from_secs(10)")]
     pub(crate) connect_timeout: Duration,
 
+    /// Whether Nagle's algorithm is disabled on the connection (`TCP_NODELAY`).
+    ///
+    /// The client writes every message at once. With Nagle's algorithm, a small
+    /// message is held back while the previous one is not acknowledged yet, which can
+    /// delay it by 40 ms and more. Disabling the algorithm sends every message
+    /// immediately; enable it only to trade latency for fewer packets.
+    ///
+    /// Default is true.
+    #[builder(default = "true")]
+    pub(crate) tcp_nodelay: bool,
+
     /// How long a closing connection waits for the server.
     ///
     /// A connection is closed with a close handshake: after the close frame was sent

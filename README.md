@@ -187,6 +187,20 @@ Whenever a connection ends, the messages that are not written yet fail with
 `Error::NotConnected` — a `SendText` / `SendBinary` never stays pending on a
 connection that is gone.
 
+## Connecting
+
+A connection attempt is limited by `connect_timeout`, which covers name resolution,
+the TCP connection, TLS, the WebSocket handshake and redirects.
+
+- **Several addresses.** If the host name resolves to more than one address, the
+  addresses are raced ("happy eyeballs", RFC 8305): the next address is tried as soon
+  as the previous one failed, or after 250 ms while it is still pending. An address
+  that does not answer — typically IPv6 without a working route — costs 250 ms instead
+  of the whole attempt.
+- **`TCP_NODELAY`** is set by default (`tcp_nodelay`): every message is sent at once
+  instead of waiting for the acknowledgement of the previous one.
+- **Handshake key.** Every attempt uses a new `Sec-WebSocket-Key` (RFC 6455 §4.1).
+
 ## Reconnection & backoff
 
 - Delay for retry *n* (1-based): `initial_backoff * backoff_factor^(n-1)`, capped at
@@ -294,6 +308,7 @@ reconnects as before. A consumer that must not reconnect after a specific status
 | `max_missed_pongs`  | 2       | Consecutive unanswered pings before reconnecting  |
 | `connect_timeout`   | 10 s    | Per-attempt connect timeout (including redirects) |
 | `close_timeout`     | 5 s     | How long a closing connection waits for the server |
+| `tcp_nodelay`       | true    | Disable Nagle's algorithm: send every message at once |
 | `max_redirects`     | 5       | HTTP redirects followed on connect                |
 | `connect_on_start`  | false   | Connect as soon as the actor starts               |
 | `initial_backoff`   | 500 ms  | First retry delay                                 |
