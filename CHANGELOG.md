@@ -15,6 +15,8 @@ _Changes in the next release_
 - `close_timeout` option: how long a closing connection waits for the server. Default is 5 seconds.
 - `Stop` message: closes the connection and stops the actor.
 - `tcp_nodelay` option, enabled by default.
+- `write_timeout` option and `Error::WriteTimeout`: drops a connection that does not take a message within the
+  given time. Off by default.
 
 ### Changed
 - **Breaking:** `on_closed`, `on_error` and `on_reconnect_exhausted` of `WebSocketMessageHandler` return a
