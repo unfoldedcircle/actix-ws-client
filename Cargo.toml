@@ -18,6 +18,8 @@ native-tls = ["dep:native-tls", "tokio-tungstenite/native-tls"]
 rustls-platform-verifier = [
     "dep:rustls",
     "dep:rustls-platform-verifier",
+    # A private feature of tokio-tungstenite: its only way to get rustls without a
+    # bundled root store. Check it when updating tokio-tungstenite.
     "tokio-tungstenite/__rustls-tls",
 ]
 

@@ -1804,10 +1804,10 @@ mod tests {
             attempts[0].options.ws_config.max_frame_size,
             defaults.max_frame_size
         );
-        // TLS verification is on by default
-        // native-tls: the transport's default connector (system roots, full verification).
+        // A connector with the defaults of the backend: system roots, full
+        // verification. It is built once and reused for every attempt.
         #[cfg(feature = "native-tls")]
-        assert!(attempts[0].options.tls.connector().unwrap().is_none());
+        assert!(attempts[0].options.tls.connector().unwrap().is_some());
     }
 
     // ------------------------------------------------------------------
