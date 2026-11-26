@@ -259,12 +259,28 @@ the queue; a further `SendText` / `SendBinary` fails immediately with
 `Error::SendQueueFull` (a handler action is dropped with a warning). Internal control
 frames (ping, pong, close) are never rejected.
 
-## Message tracing
+## Logging
 
-`msg_tracing_in` / `msg_tracing_out` log every received / sent text message at debug
-level. To keep secrets out of the log, implement
+The crate logs with the [`log`](https://docs.rs/log) crate, every line prefixed with
+the client id. Connection state changes are logged at info level, details at debug
+and trace level.
+
+**Message tracing.** `msg_tracing_in` / `msg_tracing_out` log every received / sent
+text message at debug level. To keep secrets out of the log, implement
 `WebSocketMessageHandler::redact_trace(direction, text)`: return the text to log, a
-redacted copy, or `None` to skip the message. Only the log output is affected.
+redacted copy, or `None` to skip the message. Only the log output is affected. A sent
+message is logged when it is queued, with the time since the previous one; it is also
+logged if it cannot be written afterwards.
+
+**What is never logged.** Message tracing is the only place where message contents
+are logged. Every other line, at every level, shows the size of a message instead.
+URLs are logged without user info, query and fragment, where a password or token can
+be passed; the same holds for the URL in an error text. Request headers are not
+logged.
+
+The WebSocket library below, `tungstenite`, logs the messages it reads at trace level
+under its own log target. Keep that target above trace level if message contents must
+stay out of the log.
 
 ## Callback contract
 

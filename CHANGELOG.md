@@ -59,6 +59,9 @@ _Changes in the next release_
   `SendText` / `SendBinary` request that failed.
 
 ### Fixed
+- Message contents are no longer logged at trace level, where they bypassed the `redact_trace` hook: the size is
+  logged instead.
+- URLs in log lines and error texts no longer contain user info, query and fragment.
 - The rustls backend supports TLS 1.2 without the application having to enable the `tls12` feature of rustls. Before,
   a server that does not speak TLS 1.3 failed the handshake unless another dependency happened to enable it.
 - The reconnect delay is no longer cut to whole milliseconds.

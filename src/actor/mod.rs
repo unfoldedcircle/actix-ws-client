@@ -22,6 +22,7 @@ use crate::handler::{HandlerAction, TraceDirection, WebSocketMessageHandler};
 use crate::message::{
     Close, Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText, Stop,
 };
+use crate::redact::{self, ActionLog, EffectLog};
 use crate::tls::TlsContext;
 use actix::fut::{ActorFutureExt, ActorStreamExt, wrap_future, wrap_stream};
 use actix::prelude::*;
@@ -225,7 +226,7 @@ where
         // effect list is still being executed.
         let mut pending_actions: Vec<HandlerAction> = Vec::new();
         for effect in effects {
-            trace!("[{}] Executing effect: {effect:?}", self.id);
+            trace!("[{}] Executing effect: {}", self.id, EffectLog(&effect));
             match effect {
                 Effect::StartConnect {
                     generation,
@@ -269,7 +270,11 @@ where
 
     /// Executes a [`HandlerAction`] returned from a handler callback.
     fn execute_action(&mut self, action: HandlerAction, ctx: &mut Context<Self>) {
-        trace!("[{}] Executing handler action: {action:?}", self.id);
+        trace!(
+            "[{}] Executing handler action: {}",
+            self.id,
+            ActionLog(&action)
+        );
         match action {
             HandlerAction::SendText(text) => self.send_handler_frame(Message::Text(text.into())),
             HandlerAction::SendBinary(data) => self.send_handler_frame(Message::Binary(data)),
@@ -411,14 +416,13 @@ where
         let Some(url) = provider() else {
             return Ok(());
         };
-        let mut new_request = url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| Error::InvalidRequest(format!("provider URL {url:?}: {e}")))?;
+        let mut new_request = url.as_str().into_client_request().map_err(|e| {
+            Error::InvalidRequest(format!("provider URL {:?}: {e}", redact::url(&url)))
+        })?;
         validate_request(&new_request)?;
         copy_headers(&self.request, &mut new_request, |_| true);
         if new_request.uri() != self.request.uri() {
-            debug!("[{}] Using refreshed URL: {url}", self.id);
+            debug!("[{}] Using refreshed URL: {}", self.id, redact::url(&url));
         }
         self.request = new_request;
         Ok(())

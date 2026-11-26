@@ -82,6 +82,7 @@ mod core;
 mod error;
 mod handler;
 mod message;
+mod redact;
 mod tls;
 
 pub use actor::GenericWebSocketClient;

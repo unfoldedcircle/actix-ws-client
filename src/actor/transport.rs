@@ -6,6 +6,7 @@
 use crate::Error;
 use crate::actor::tcp;
 use crate::core::event::{CloseInfo, Frame};
+use crate::redact;
 use crate::tls::TlsContext;
 use futures::stream::StreamExt;
 use futures::{Sink, Stream};
@@ -141,7 +142,8 @@ async fn connect_follow_redirects(
                     .map_err(|e| Error::WebSocket(format!("Invalid Location header: {e}")))?;
 
                 debug!(
-                    "Following redirect to {location} (status {})",
+                    "Following redirect to {} (status {})",
+                    redact::url(location),
                     resp.status()
                 );
                 request = build_redirect_request(&request, location)?;
@@ -316,7 +318,8 @@ fn build_redirect_request(current: &WsRequest, location: &str) -> Result<WsReque
         format!("{scheme}://{authority}{location}")
     } else {
         return Err(Error::WebSocket(format!(
-            "Unsupported redirect Location: {location}"
+            "Unsupported redirect Location: {}",
+            redact::url(location)
         )));
     };
 
