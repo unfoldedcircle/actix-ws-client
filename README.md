@@ -93,9 +93,10 @@ wraps its input as an `Event`, calls the machine, and executes the returned effe
 
 `Disconnected → Connecting → Connected → WaitingToReconnect (→ Connecting …)`
 
-There is no dedicated `Closing` state (the task plan listed one): a graceful
-disconnect enqueues the Close frame and tears down in a single transition, because the
-writer task drains its queue before terminating.
+There is no dedicated `Closing` state: a graceful disconnect enqueues the Close frame
+and hands the connection over to its task in a single transition. The task completes
+the close handshake in the background (see [Closing a connection](#closing-a-connection)),
+while the machine is `Disconnected` — or already connecting again — right away.
 
 ### Events (inputs)
 
@@ -105,8 +106,8 @@ writer task drains its queue before terminating.
 
 ### Effects (outputs)
 
-`StartConnect{gen, timeout}`, `StartWriterTask{gen}`, `StartReaderTask{gen}`,
-`SendFrame{frame}`, `TearDownConnection{gen}`, `ArmReconnectTimer{delay}`,
+`StartConnect{gen, timeout}`, `StartConnectionTask{gen}`,
+`SendFrame{frame}`, `TearDownConnection{gen, mode}`, `ArmReconnectTimer{delay}`,
 `StartKeepAlive{gen, interval}`, `StopKeepAlive`, `Emit(callback)`,
 `CompleteConnect{result}`.
 
@@ -122,14 +123,48 @@ or timer tick from a dead connection is simply dropped.
 
 ## Connection I/O ownership
 
-- **Writer task** owns the sink for the connection's lifetime. The actor holds only an
-  `mpsc::Sender`; sending is a synchronous channel push (never `await` in a handler),
-  ordering is FIFO. Teardown = drop the sender: the task drains its queue (a final
-  Close frame still reaches the wire) and ends, dropping the sink. Send completions
-  are delivered through per-message oneshot channels carried alongside the frame (the
-  task plan's `CompleteSend` registry turned out unnecessary).
-- **Reader task** owns the stream and forwards frames to the actor. It is an
-  actor-owned future, cancelled via its `SpawnHandle` on teardown. No `ctx.add_stream`.
+One detached **connection task** owns both halves of an established connection for its
+entire lifetime. It talks to the actor over channels only and holds no address of it.
+
+- **Writing.** The actor holds only an `mpsc::Sender`; sending is a synchronous channel
+  push (never `await` in a handler), ordering is FIFO. Send completions are delivered
+  through per-message oneshot channels carried alongside the frame.
+- **Reading.** Received frames are reported over a bounded channel to an actor-owned
+  future, which is cancelled via its `SpawnHandle` on teardown. A slow handler slows
+  down reading instead of growing a queue. No `ctx.add_stream`.
+- **Teardown.** The core decides how a connection ends, the task carries it out on its
+  own while the actor moves on, see the next section.
+
+## Closing a connection
+
+| Cause                                              | Teardown                                    |
+|----------------------------------------------------|---------------------------------------------|
+| `Disconnect` / `Close` / `Reconnect`, actor stopped | Close handshake started by the client       |
+| Close frame of the server                          | Close handshake started by the server       |
+| Read or write error, keep-alive timeout            | Connection dropped at once                  |
+
+**Close handshake started by the client.** Messages sent before are still written,
+followed by the Close frame. The client then keeps reading — received messages are
+discarded — until the server answered the Close frame and closed the connection.
+
+**Close handshake started by the server.** The transport answers the Close frame with
+the status of the server. Nothing else can be written anymore. The client keeps
+reading until the server closed the connection.
+
+Waiting for the server is limited by `close_timeout`: after that, the connection is
+dropped. The wait happens in the background. The client is disconnected right away
+(`on_closed` / `on_disconnected` are called, sending fails with `NotConnected`), and a
+reconnect is not delayed by a server that is slow to close.
+
+`Disconnect` and `Close` resolve once the connection is closed. Await them for a clean
+shutdown before the process exits; use `do_send` to not wait.
+
+**Connection dropped at once.** A broken connection is not closed gracefully: there is
+nobody to complete a handshake with (RFC 6455 §7.1.7 "Fail the WebSocket Connection").
+
+Whenever a connection ends, the messages that are not written yet fail with
+`Error::NotConnected` — a `SendText` / `SendBinary` never stays pending on a
+connection that is gone.
 
 ## Reconnection & backoff
 
@@ -159,9 +194,8 @@ increments; at `max_missed_pongs` the connection is dropped **without** a Close
 handshake (RFC 6455 §7.1.7 "Fail the WebSocket Connection") and reconnection starts.
 The detection budget is exactly `max_missed_pongs * ping_interval` after the first
 unanswered ping. A ping counts as answered when **any** frame is received after it,
-not only its pong: a peer that keeps sending data is alive. Server pings are answered explicitly with a matching pong: with a
-split sink/stream, the transport's automatic pong would only be flushed on our next
-write (P2-4).
+not only its pong: a peer that keeps sending data is alive. Server pings are answered
+by the transport with a matching pong.
 
 For servers with an application-level heartbeat, set `ping_enabled(false)`: no ping
 frames are sent and no keep-alive timer runs. The consumer then sends its own
@@ -230,6 +264,7 @@ reconnects as before. A consumer that must not reconnect after a specific status
 | `ping_interval`     | 30 s    | Keep-alive ping interval                          |
 | `max_missed_pongs`  | 2       | Consecutive unanswered pings before reconnecting  |
 | `connect_timeout`   | 10 s    | Per-attempt connect timeout (including redirects) |
+| `close_timeout`     | 5 s     | How long a closing connection waits for the server |
 | `max_redirects`     | 5       | HTTP redirects followed on connect                |
 | `connect_on_start`  | false   | Connect as soon as the actor starts               |
 | `initial_backoff`   | 500 ms  | First retry delay                                 |
@@ -258,8 +293,9 @@ Redirects support absolute, scheme-relative and absolute-path `Location` values;
 | Layer             | Location                      | Covers                                                                                                                         |
 |-------------------|-------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
 | Pure unit tests   | `src/core/*` (`#[cfg(test)]`) | All state transitions, generation filtering, keep-alive budget, backoff math, flapping protection, callback balance            |
+| Connection task   | `src/actor/connection.rs` tests | Teardown of a connection against mock transport halves: abort, close handshake, close timeout, stalled socket                |
 | Actor integration | `src/actor/mod.rs` tests      | Effect wiring against a mock `Transport` (no TCP): reconnect, disconnect during reconnect, write-failure recovery, close frame |
-| End-to-end        | `tests/e2e.rs`                | Real local server: echo roundtrip, close handshake, HTTP redirect, unreachable host                                            |
+| End-to-end        | `tests/e2e.rs`                | Real local server: echo roundtrip, close handshake, ping/pong, HTTP redirect, unreachable host                                 |
 | End-to-end TLS    | `tests/tls.rs`                | Real local `wss://` server with a private CA: rejection of an untrusted certificate, trusted roots, disabled verification, ready-made connectors |
 
 Run with `cargo test`. The TLS tests run against the backend the crate is built with:

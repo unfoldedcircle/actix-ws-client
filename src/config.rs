@@ -59,6 +59,21 @@ pub struct WebSocketConfig {
     #[builder(default = "Duration::from_secs(10)")]
     pub(crate) connect_timeout: Duration,
 
+    /// How long a closing connection waits for the server.
+    ///
+    /// A connection is closed with a close handshake: after the close frame was sent
+    /// ([`crate::Disconnect`], [`crate::Close`], [`crate::Reconnect`]) or received,
+    /// the client waits until the server closed the connection. If that takes longer
+    /// than this timeout, the connection is dropped; messages that could not be
+    /// written until then fail with [`crate::Error::NotConnected`].
+    ///
+    /// The wait happens in the background: the client is disconnected right away and
+    /// a reconnect is not delayed. `Duration::ZERO` does not wait for the server.
+    ///
+    /// Default is 5 seconds.
+    #[builder(default = "Duration::from_secs(5)")]
+    pub(crate) close_timeout: Duration,
+
     /// Minimum time a connection must stay up before the reconnection attempt counter
     /// is reset to zero.
     ///

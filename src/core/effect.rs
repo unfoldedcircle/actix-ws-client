@@ -27,6 +27,25 @@ pub(crate) enum Callback {
     OnReconnectExhausted,
 }
 
+/// How the adapter ends a connection, see [`Effect::TearDownConnection`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Teardown {
+    /// Drop the connection at once; messages that are not written yet fail.
+    ///
+    /// Used when the connection is broken (read or write error, keep-alive timeout)
+    /// and when there is no established connection (cancelled connection attempt or
+    /// reconnect timer).
+    Abort,
+    /// A close frame was enqueued: write the queue including the close frame, then
+    /// wait until the server answered it and closed the connection — at most for the
+    /// close timeout.
+    Close,
+    /// The server sent a close frame, so nothing can be written anymore. The
+    /// transport answers the close frame itself: wait until the server closed the
+    /// connection — at most for the close timeout.
+    PeerClosed,
+}
+
 /// An instruction from the core to the I/O adapter (the actor).
 ///
 /// The core decides *what* should happen; the adapter executes it. Effects never carry
@@ -42,26 +61,24 @@ pub(crate) enum Effect {
         /// Connect timeout (including redirects).
         timeout: Duration,
     },
-    /// Start the writer task owning the sink of connection `generation`.
-    StartWriterTask {
+    /// Start the connection task owning the transport of connection `generation`.
+    StartConnectionTask {
         /// Generation of the connection.
         generation: u64,
     },
-    /// Start the reader task owning the stream of connection `generation`.
-    StartReaderTask {
-        /// Generation of the connection.
-        generation: u64,
-    },
-    /// Enqueue a core-originated frame (ping, pong reply, close) to the writer.
+    /// Enqueue a core-originated frame (ping, close) to the writer.
     SendFrame {
         /// The frame to send.
         frame: Frame,
     },
-    /// Tear down all per-connection resources of `generation`: drop the writer sender,
-    /// cancel the reader task, connect task, keep-alive and reconnect timers.
+    /// Tear down all per-connection resources of `generation`: end the connection
+    /// task as given by `mode`, cancel the connect task, keep-alive and reconnect
+    /// timers.
     TearDownConnection {
         /// Generation of the connection to tear down.
         generation: u64,
+        /// How the connection is ended.
+        mode: Teardown,
     },
     /// Arm the reconnect timer with the given delay.
     ArmReconnectTimer {

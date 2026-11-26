@@ -15,6 +15,10 @@ pub struct IsConnected;
 pub struct Connect;
 
 /// Message sent to the [`crate::GenericWebSocketClient`] to send a text frame.
+///
+/// The reply resolves once the message is written to the socket. It fails with
+/// [`Error::NotConnected`] if there is no connection, or if the connection ends before
+/// the message is written.
 #[derive(Message, Clone)]
 #[rtype(result = "Result<(), Error>")]
 pub struct SendText {
@@ -30,6 +34,8 @@ impl SendText {
 }
 
 /// Message sent to the [`crate::GenericWebSocketClient`] to send a binary frame.
+///
+/// The reply resolves like the one of [`SendText`].
 #[derive(Message, Clone)]
 #[rtype(result = "Result<(), Error>")]
 pub struct SendBinary {
@@ -46,9 +52,15 @@ impl SendBinary {
 
 /// Message sent to the [`crate::GenericWebSocketClient`] to trigger a graceful disconnect.
 ///
-/// This will send a Close frame to the server before tearing down the connection.
+/// This will send a Close frame to the server and complete the close handshake.
 /// Automatic reconnection is stopped; a subsequent [`Connect`] is required to
 /// re-establish the connection.
+///
+/// The client is disconnected right away: callbacks are called and sending fails
+/// before the reply arrives. Messages sent before are still written. The reply
+/// resolves once the connection is closed: when the server answered the Close frame and
+/// closed the connection, or after [`crate::WebSocketConfig`] `close_timeout`. Await
+/// it before the process exits, or use `do_send` to not wait.
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Disconnect;
@@ -57,7 +69,8 @@ pub struct Disconnect;
 /// with a specific close status code and reason.
 ///
 /// Same semantics as [`Disconnect`], which closes with status 1000 (normal closure)
-/// and no reason. Without an established connection no close frame is sent.
+/// and no reason: the reply resolves once the connection is closed. Without an
+/// established connection no close frame is sent.
 ///
 /// With [`Close::with_reconnect`] the client does not stop: after closing it reconnects
 /// according to the reconnect policy, as if the connection had been lost — with

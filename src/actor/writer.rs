@@ -1,13 +1,17 @@
-//! Per-connection writer task.
+//! Write side of the connection task, see [`crate::actor::connection`].
 //!
-//! The task owns the `Sink` half of the connection for the connection's entire
-//! lifetime — it is never lent back to the actor, so the take/restore race of the old
-//! implementation (P0-1) cannot exist. The actor only holds the channel `Sender`:
+//! The writer owns the `Sink` half of the connection for the connection's entire
+//! lifetime — it is never lent back to the actor. The actor only holds the channel
+//! `Sender`:
 //!
 //! - Sending is a synchronous, non-awaiting channel push in the actor.
 //! - Writes are serialized FIFO by the single-consumer channel.
-//! - Teardown = drop the `Sender`: the task drains the remaining queue (so a final
-//!   Close frame still reaches the wire) and ends, dropping the sink.
+//! - Once the `Sender` is dropped, the writer writes the remaining queue (so a final
+//!   Close frame still reaches the wire) and ends.
+//!
+//! A write waits for as long as the socket does not take the data. The connection
+//! task ends a writer that must not wait any longer by dropping it; the messages it
+//! still holds are dropped with it.
 
 use crate::Error;
 use crate::actor::transport::BoxSink;
@@ -18,11 +22,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-/// A message queued for the writer task, with an optional completion channel.
+/// A message queued for the writer, with an optional completion channel.
 pub(crate) struct WriteItem {
     /// The message to write.
     pub msg: Message,
     /// Resolved with the write result; `None` for fire-and-forget frames (pings etc.).
+    /// Dropped without a result if the connection ends before the message is written.
     pub tx: Option<oneshot::Sender<Result<(), Error>>>,
 }
 
@@ -32,7 +37,7 @@ pub(crate) struct WriteItem {
 /// the actor: the actor increments it for every message it enqueues.
 ///
 /// Returns `Some(error)` if a write failed (the caller reports it to the actor as a
-/// `WriteFailed` event) or `None` on graceful termination.
+/// `WriteFailed` event) or `None` once the queue is closed and written.
 pub(crate) async fn run_writer(
     mut sink: BoxSink,
     mut rx: mpsc::UnboundedReceiver<WriteItem>,
@@ -60,13 +65,12 @@ pub(crate) async fn run_writer(
                         let _ = tx.send(Err(Error::NotConnected));
                     }
                 }
-                debug!("Writer task ending after write failure: {error}");
+                debug!("Writer ending after write failure: {error}");
                 return Some(error);
             }
         }
     }
-    // All senders dropped: normal teardown. Dropping the sink (together with the
-    // reader dropping the stream half) closes the underlying connection.
+    // The sender is dropped and the queue is written.
     None
 }
 

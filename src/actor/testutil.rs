@@ -5,6 +5,7 @@ use super::transport::{BoxSink, BoxStream, ConnectFuture, ConnectOptions, Transp
 use crate::Error;
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio_tungstenite::tungstenite::Error as WsError;
@@ -78,6 +79,79 @@ impl futures::Sink<Message> for BlockedSink {
 /// Creates a sink that never accepts a message.
 pub(crate) fn blocked_sink() -> BoxSink {
     Box::pin(BlockedSink)
+}
+
+/// Set when the tracked transport half has been dropped, see [`track_sink`] and
+/// [`track_stream`].
+pub(crate) type Dropped = Arc<AtomicBool>;
+
+/// Sets its flag when dropped.
+struct DropFlag(Dropped);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Sink wrapper reporting when the client dropped its half of the connection.
+struct TrackedSink {
+    inner: BoxSink,
+    _flag: DropFlag,
+}
+
+impl futures::Sink<Message> for TrackedSink {
+    type Error = WsError;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+        self.inner.as_mut().poll_ready(cx)
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), WsError> {
+        self.inner.as_mut().start_send(item)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+        self.inner.as_mut().poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+        self.inner.as_mut().poll_close(cx)
+    }
+}
+
+/// Wraps a sink; the returned flag is set once the client dropped it.
+pub(crate) fn track_sink(sink: BoxSink) -> (BoxSink, Dropped) {
+    let dropped = Dropped::default();
+    let sink = TrackedSink {
+        inner: sink,
+        _flag: DropFlag(dropped.clone()),
+    };
+    (Box::pin(sink), dropped)
+}
+
+/// Stream wrapper reporting when the client dropped its half of the connection.
+struct TrackedStream {
+    inner: BoxStream,
+    _flag: DropFlag,
+}
+
+impl futures::Stream for TrackedStream {
+    type Item = Result<Message, WsError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+/// Wraps a stream; the returned flag is set once the client dropped it.
+pub(crate) fn track_stream(stream: BoxStream) -> (BoxStream, Dropped) {
+    let dropped = Dropped::default();
+    let stream = TrackedStream {
+        inner: stream,
+        _flag: DropFlag(dropped.clone()),
+    };
+    (Box::pin(stream), dropped)
 }
 
 /// In-memory stream: push items via the sender; drop the sender to end the stream.
