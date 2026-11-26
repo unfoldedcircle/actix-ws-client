@@ -48,8 +48,8 @@ TLS options of `WebSocketConfig`, working with both backends:
 - `GenericWebSocketClient::<H>::new(id, request, config, handler)` — construct the
   actor; optionally chain `.with_url_provider(...)`; start it with `.start()`.
 - Messages: `Connect`, `Disconnect` (close, stop reconnecting), `Close` (like
-  `Disconnect`, with a close status code and reason), `Reconnect` (close,
-  reconnect per policy with a fresh attempt counter), `Stop` (close, stop the actor),
+  `Disconnect`, with a close status code and reason), `Reconnect` (close, connect
+  again at once with a fresh attempt counter), `Stop` (close, stop the actor),
   `SendText`, `SendBinary`, `IsConnected`.
 - `WebSocketMessageHandler` — callback trait (`on_text`, `on_binary`, `on_connected`,
   `on_closed`, `on_disconnected`, `on_error`, `on_reconnect_exhausted`, `redact_trace`). `on_text` / `on_binary` /
@@ -196,6 +196,14 @@ connection that is gone.
   `min_stable_uptime` — a flapping link keeps growing its backoff instead of hammering
   the server (P1-2).
 - A user-initiated `Connect` or `Reconnect` starts a fresh backoff sequence.
+- `Connect` resolves with the result of the connection attempt: `Ok` once connected
+  (at once if the client is connected already), the error of a failed attempt, or
+  `Error::StateChanged` if the attempt was cancelled by a disconnect. A request while
+  an attempt is running joins that attempt — also the one of `connect_on_start`.
+- `Reconnect` connects again at once, in every state: it closes an established
+  connection, skips a pending backoff delay, and replaces a running connection
+  attempt (the URL provider is asked again). Use it after an address change, or when
+  the network came back.
 - `Disconnect` during `WaitingToReconnect` cancels the timer; a racing timer tick is
   ignored by the core.
 - **Attempt cap:** with `max_reconnect_attempts = Some(n)`, exactly `n` consecutive

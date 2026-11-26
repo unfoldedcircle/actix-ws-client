@@ -123,8 +123,8 @@ where
     // Transport halves stashed between connect completion and the
     // StartConnectionTask effect consuming them.
     pending_transport: Option<(BoxSink, BoxStream)>,
-    // Reply channel of an in-flight `Connect` request.
-    pending_connect: Option<oneshot::Sender<Result<(), Error>>>,
+    // Reply channels of the `Connect` requests waiting for the running attempt.
+    pending_connects: Vec<oneshot::Sender<Result<(), Error>>>,
     // Optional per-attempt URL refresh hook.
     url_provider: Option<UrlProvider>,
     // TLS settings shared by all connection attempts.
@@ -181,7 +181,7 @@ where
             reconnect_handle: None,
             closing: Vec::new(),
             pending_transport: None,
-            pending_connect: None,
+            pending_connects: Vec::new(),
             url_provider: None,
             last_msg_send_time: None,
         })
@@ -209,12 +209,8 @@ where
     // ========================================================================
 
     /// Feeds an event into the core and executes the returned effects.
-    ///
-    /// Returns `true` if a connection attempt was started (used by the `Connect`
-    /// handler to distinguish accepted from rejected requests).
-    fn dispatch(&mut self, event: Event, ctx: &mut Context<Self>) -> bool {
+    fn dispatch(&mut self, event: Event, ctx: &mut Context<Self>) {
         let effects = self.machine.on_event(event, Instant::now());
-        let mut started_connect = false;
         // Handler actions are collected during effect execution and run after the
         // whole batch, so an action cannot re-enter the machine while the current
         // effect list is still being executed.
@@ -225,10 +221,7 @@ where
                 Effect::StartConnect {
                     generation,
                     timeout,
-                } => {
-                    started_connect = true;
-                    self.start_connect(generation, timeout, ctx);
-                }
+                } => self.start_connect(generation, timeout, ctx),
                 Effect::StartConnectionTask { generation } => {
                     self.start_connection(generation, ctx)
                 }
@@ -244,8 +237,8 @@ where
                 Effect::StopKeepAlive => self.stop_keepalive(ctx),
                 Effect::Emit(callback) => pending_actions.extend(self.emit(callback)),
                 Effect::CompleteConnect { result } => {
-                    if let Some(tx) = self.pending_connect.take() {
-                        let _ = tx.send(result);
+                    for tx in self.pending_connects.drain(..) {
+                        let _ = tx.send(result.clone());
                     }
                 }
             }
@@ -259,7 +252,6 @@ where
         for action in pending_actions {
             self.execute_action(action, ctx);
         }
-        started_connect
     }
 
     /// Executes a [`HandlerAction`] returned from a handler callback.
@@ -634,17 +626,12 @@ impl<H: WebSocketMessageHandler> Handler<Connect> for GenericWebSocketClient<H> 
     type Result = ResponseFuture<Result<(), Error>>;
 
     fn handle(&mut self, _msg: Connect, ctx: &mut Context<Self>) -> Self::Result {
+        // Resolved by the CompleteConnect effect: at once if the client is connected,
+        // else with the result of the connection attempt — the one this request
+        // starts, or the one that is running already.
         let (tx, rx) = oneshot::channel();
-        if self.dispatch(Event::ConnectRequested, ctx) {
-            // Accepted: resolved by the CompleteConnect effect. A previous pending
-            // request cannot normally exist here; resolve it defensively if it does.
-            if let Some(previous) = self.pending_connect.replace(tx) {
-                let _ = previous.send(Err(Error::StateChanged));
-            }
-        } else {
-            // Rejected: already connecting or connected.
-            let _ = tx.send(Err(Error::StateChanged));
-        }
+        self.pending_connects.push(tx);
+        self.dispatch(Event::ConnectRequested, ctx);
         Box::pin(async move {
             match rx.await {
                 Ok(result) => result,

@@ -96,7 +96,7 @@ pub(crate) enum Effect {
     StopKeepAlive,
     /// Invoke a user callback.
     Emit(Callback),
-    /// Resolve the pending [`crate::Connect`] request, if any.
+    /// Resolve the pending [`crate::Connect`] requests, if any.
     CompleteConnect {
         /// Result to deliver to the caller.
         result: Result<(), Error>,

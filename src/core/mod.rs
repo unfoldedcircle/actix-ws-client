@@ -169,9 +169,10 @@ impl Machine {
                 self.reconnection_attempts = 0;
                 self.start_connect()
             }
-            // Already connecting or connected: the adapter answers `StateChanged`
-            // when no `StartConnect` effect is returned.
-            ConnState::Connecting | ConnState::Connected => Vec::new(),
+            // The running attempt answers the request with its result.
+            ConnState::Connecting => Vec::new(),
+            // Nothing to do: the request is fulfilled.
+            ConnState::Connected => vec![Effect::CompleteConnect { result: Ok(()) }],
         }
     }
 
@@ -244,8 +245,18 @@ impl Machine {
                 self.reconnection_attempts = 0;
                 self.start_connect()
             }
-            // A connection attempt is already in progress.
-            ConnState::Connecting => Vec::new(),
+            ConnState::Connecting => {
+                // Replace the running attempt: it may target an address that is
+                // not valid anymore. It is cancelled without an answer, so a
+                // pending connect request is answered by the new attempt.
+                self.reconnection_attempts = 0;
+                let mut effects = vec![Effect::TearDownConnection {
+                    generation: self.generation,
+                    mode: Teardown::Abort,
+                }];
+                effects.extend(self.start_connect());
+                effects
+            }
         }
     }
 

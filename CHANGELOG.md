@@ -25,6 +25,11 @@ _Changes in the next release_
   Before, a connected or reconnecting client kept running without an address. Keep the address of a client for as
   long as it should run.
 
+- `Connect` resolves with `Ok` when the client is connected already, and joins a running connection attempt instead
+  of failing with `Error::StateChanged`. `StateChanged` now only means that the attempt was cancelled by a disconnect.
+- `Reconnect` during a connection attempt cancels the attempt and starts a new one with a fresh attempt counter. Before,
+  it was ignored.
+
 ### Fixed
 - A stalled socket is dropped when its connection ends. Before, the connection stayed open and pending `SendText` /
   `SendBinary` requests never resolved, also after a keep-alive timeout.
