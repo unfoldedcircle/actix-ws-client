@@ -6,6 +6,7 @@
 use crate::Error;
 use crate::actor::tcp;
 use crate::core::event::{CloseInfo, Frame};
+use crate::redact;
 use crate::tls::TlsContext;
 use futures::stream::StreamExt;
 use futures::{Sink, Stream};
@@ -141,7 +142,8 @@ async fn connect_follow_redirects(
                     .map_err(|e| Error::WebSocket(format!("Invalid Location header: {e}")))?;
 
                 debug!(
-                    "Following redirect to {location} (status {})",
+                    "Following redirect to {} (status {})",
+                    redact::url(location),
                     resp.status()
                 );
                 request = build_redirect_request(&request, location)?;
@@ -316,7 +318,8 @@ fn build_redirect_request(current: &WsRequest, location: &str) -> Result<WsReque
         format!("{scheme}://{authority}{location}")
     } else {
         return Err(Error::WebSocket(format!(
-            "Unsupported redirect Location: {location}"
+            "Unsupported redirect Location: {}",
+            redact::url(location)
         )));
     };
 
@@ -642,6 +645,16 @@ mod tests {
         // Headers of the handshake are created for the new request, not copied twice.
         assert_eq!(new.headers().get_all("host").iter().count(), 1);
         assert_eq!(new.headers().get_all("sec-websocket-key").iter().count(), 1);
+    }
+
+    #[test]
+    fn redirect_error_does_not_contain_url_secrets() {
+        let req = request("ws://example.com/socket");
+
+        let error = build_redirect_request(&req, "relative/path?token=token-4713").unwrap_err();
+
+        assert!(!error.to_string().contains("token-4713"), "{error}");
+        assert!(error.to_string().contains("relative/path"), "{error}");
     }
 
     #[test]

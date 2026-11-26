@@ -22,6 +22,7 @@ use crate::handler::{HandlerAction, TraceDirection, WebSocketMessageHandler};
 use crate::message::{
     Close, Connect, Disconnect, IsConnected, Reconnect, SendBinary, SendText, Stop,
 };
+use crate::redact::{self, ActionLog, EffectLog};
 use crate::tls::TlsContext;
 use actix::fut::{ActorFutureExt, ActorStreamExt, wrap_future, wrap_stream};
 use actix::prelude::*;
@@ -225,7 +226,7 @@ where
         // effect list is still being executed.
         let mut pending_actions: Vec<HandlerAction> = Vec::new();
         for effect in effects {
-            trace!("[{}] Executing effect: {effect:?}", self.id);
+            trace!("[{}] Executing effect: {}", self.id, EffectLog(&effect));
             match effect {
                 Effect::StartConnect {
                     generation,
@@ -269,7 +270,11 @@ where
 
     /// Executes a [`HandlerAction`] returned from a handler callback.
     fn execute_action(&mut self, action: HandlerAction, ctx: &mut Context<Self>) {
-        trace!("[{}] Executing handler action: {action:?}", self.id);
+        trace!(
+            "[{}] Executing handler action: {}",
+            self.id,
+            ActionLog(&action)
+        );
         match action {
             HandlerAction::SendText(text) => self.send_handler_frame(Message::Text(text.into())),
             HandlerAction::SendBinary(data) => self.send_handler_frame(Message::Binary(data)),
@@ -411,14 +416,13 @@ where
         let Some(url) = provider() else {
             return Ok(());
         };
-        let mut new_request = url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| Error::InvalidRequest(format!("provider URL {url:?}: {e}")))?;
+        let mut new_request = url.as_str().into_client_request().map_err(|e| {
+            Error::InvalidRequest(format!("provider URL {:?}: {e}", redact::url(&url)))
+        })?;
         validate_request(&new_request)?;
         copy_headers(&self.request, &mut new_request, |_| true);
         if new_request.uri() != self.request.uri() {
-            debug!("[{}] Using refreshed URL: {url}", self.id);
+            debug!("[{}] Using refreshed URL: {}", self.id, redact::url(&url));
         }
         self.request = new_request;
         Ok(())
@@ -729,8 +733,8 @@ impl<H: WebSocketMessageHandler> Handler<SendBinary> for GenericWebSocketClient<
 #[cfg(test)]
 mod tests {
     use super::testutil::{
-        MockTransport, blocked_sink, broken_pipe, failing_sink, mock_sink, scripted_stream,
-        track_sink, track_stream,
+        MockTransport, blocked_sink, broken_pipe, captured_logs, failing_sink, mock_sink,
+        scripted_stream, track_sink, track_stream,
     };
     use super::*;
     use crate::{DisconnectReason, WebSocketConfig};
@@ -2259,6 +2263,124 @@ mod tests {
             "{log:?}"
         );
         drop(log);
+        addr.do_send(Disconnect);
+    }
+
+    // ------------------------------------------------------------------
+    // Logging
+    // ------------------------------------------------------------------
+
+    /// The log lines that contain `needle`.
+    fn logged(needle: &str) -> Vec<String> {
+        captured_logs()
+            .into_iter()
+            .filter(|line| line.contains(needle))
+            .collect()
+    }
+
+    /// Message contents are only logged by message tracing, which the handler can
+    /// redact. No other log line may contain them, at any level.
+    #[actix_rt::test]
+    async fn message_contents_are_not_logged() {
+        captured_logs(); // install the logger
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        handler.set_text_actions(vec![
+            HandlerAction::SendText("secret-reply-4711".into()),
+            HandlerAction::SendBinary(Bytes::from_static(b"\x01\x02\x03\x04\x05\x06\x07")),
+        ]);
+        let addr = GenericWebSocketClient::with_transport(
+            "log-contents",
+            "ws://localhost",
+            config(),
+            handler.clone(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .start();
+        addr.send(Connect).await.unwrap().unwrap();
+
+        script
+            .unbounded_send(Ok(Message::Text("secret-inbound-4711".into())))
+            .unwrap();
+        script
+            .unbounded_send(Ok(Message::Binary(Bytes::from_static(
+                b"\x11\x12\x13\x14\x15\x16\x17",
+            ))))
+            .unwrap();
+        addr.send(SendText::new("secret-outbound-4711"))
+            .await
+            .unwrap()
+            .unwrap();
+        wait_until(|| sent.lock().unwrap().len() == 3, "all frames sent").await;
+        wait_until(|| handler.log_contains("binary:7"), "binary received").await;
+
+        // The trace level was logged ...
+        assert!(!logged("[log-contents] Executing effect").is_empty());
+        assert!(!logged("[log-contents] Executing handler action").is_empty());
+        // ... without the contents of the messages.
+        assert_eq!(logged("secret-inbound-4711"), Vec::<String>::new());
+        assert_eq!(logged("secret-reply-4711"), Vec::<String>::new());
+        assert_eq!(logged("secret-outbound-4711"), Vec::<String>::new());
+        // Binary payloads as Debug print them.
+        assert_eq!(logged("\\x11\\x12\\x13"), Vec::<String>::new());
+        assert_eq!(logged("\\x01\\x02\\x03"), Vec::<String>::new());
+        addr.do_send(Disconnect);
+    }
+
+    /// A URL can carry credentials: as user info, or as a token in the query.
+    #[actix_rt::test]
+    async fn url_secrets_are_not_logged() {
+        captured_logs(); // install the logger
+        let (sink, _sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, attempts) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let addr = GenericWebSocketClient::with_transport(
+            "log-url",
+            "ws://original:1234",
+            config(),
+            TestHandler::default(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .with_url_provider(|| {
+            Some("ws://user:password-4711@refreshed:5678/socket?token=token-4711".into())
+        })
+        .start();
+        addr.send(Connect).await.unwrap().unwrap();
+
+        // The secrets are used for the connection ...
+        assert!(attempts.lock().unwrap()[0].uri.contains("token-4711"));
+        // ... but only the target is logged.
+        assert!(!logged("refreshed:5678/socket").is_empty());
+        assert_eq!(logged("token-4711"), Vec::<String>::new());
+        assert_eq!(logged("password-4711"), Vec::<String>::new());
+        addr.do_send(Disconnect);
+    }
+
+    /// The error of an invalid URL reaches the caller, `on_error` and the log.
+    #[actix_rt::test]
+    async fn url_secrets_are_not_part_of_an_error() {
+        captured_logs(); // install the logger
+        let (transport, _) = MockTransport::scripted(vec![]);
+        let addr = GenericWebSocketClient::with_transport(
+            "log-error",
+            "ws://localhost",
+            config(),
+            TestHandler::default(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .with_url_provider(|| Some("not a url/socket?token=token-4712".into()))
+        .start();
+
+        let error = addr.send(Connect).await.unwrap().unwrap_err();
+
+        assert!(matches!(error, Error::InvalidRequest(_)));
+        assert!(!error.to_string().contains("token-4712"), "{error}");
+        assert_eq!(logged("token-4712"), Vec::<String>::new());
         addr.do_send(Disconnect);
     }
 }
