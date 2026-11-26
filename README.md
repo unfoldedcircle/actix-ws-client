@@ -131,8 +131,8 @@ while the machine is `Disconnected` — or already connecting again — right aw
 
 ### Events (inputs)
 
-`ConnectRequested`, `DisconnectRequested`, `ConnectSucceeded{gen}`,
-`ConnectFailed{gen, error}`, `FrameReceived{gen, frame}`, `StreamEnded{gen, error}`,
+`ConnectRequested`, `DisconnectRequested`, `CloseRequested{close, reconnect}`,
+`ReconnectRequested`, `ConnectSucceeded{gen}`, `ConnectFailed{gen, error}`, `FrameReceived{gen, frame}`, `StreamEnded{gen, error}`,
 `WriteFailed{gen, error}`, `KeepAliveTick{gen}`, `ReconnectTimerFired{gen}`.
 
 ### Effects (outputs)
@@ -148,9 +148,9 @@ Every connection attempt gets a fresh, strictly increasing `generation: u64`. Al
 per-connection tasks and timers are tagged with it, and every event they produce
 carries it back. The core ignores events from any generation but the current one.
 
-This makes the entire class of "stale resource re-enters the actor" bugs (REVIEW.md
-P0-1, P0-2) harmless **by construction**: a late write failure, frame, end-of-stream
-or timer tick from a dead connection is simply dropped.
+This makes the entire class of "stale resource re-enters the actor" bugs harmless
+**by construction**: a late connect result, write failure, frame, end-of-stream or
+timer tick from a dead connection is simply dropped.
 
 ## Connection I/O ownership
 
@@ -218,7 +218,7 @@ the TCP connection, TLS, the WebSocket handshake and redirects.
   `j ∈ [0, 1)` from `fastrand`).
 - The attempt counter resets only after a connection stayed up for at least
   `min_stable_uptime` — a flapping link keeps growing its backoff instead of hammering
-  the server (P1-2).
+  the server.
 - A user-initiated `Connect` or `Reconnect` starts a fresh backoff sequence.
 - `Connect` resolves with the result of the connection attempt: `Ok` once connected
   (at once if the client is connected already), the error of a failed attempt, or
@@ -242,7 +242,7 @@ the TCP connection, TLS, the WebSocket handshake and redirects.
 ## Keep-alive
 
 Single interval timer, evaluated on the tick (no second monitor timer, no moving
-reference instant — P1-1): if the previous ping is unanswered, the missed counter
+reference instant): if the previous ping is unanswered, the missed counter
 increments; at `max_missed_pongs` the connection is dropped **without** a Close
 handshake (RFC 6455 §7.1.7 "Fail the WebSocket Connection") and reconnection starts.
 The detection budget is exactly `max_missed_pongs * ping_interval` after the first
@@ -250,12 +250,23 @@ unanswered ping. A ping counts as answered when **any** frame is received after 
 not only its pong: a peer that keeps sending data is alive. Server pings are answered
 by the transport with a matching pong.
 
+**After a system suspend.** The timers of the client do not run while the system
+sleeps, and they do not catch up afterwards. A connection that died during the sleep
+is detected two to three ping intervals after the system woke up — 60 to 90 seconds
+with the defaults. An application that knows when the system resumes should send
+`Reconnect` then: it replaces the connection, or a connection attempt that is
+running, at once.
+
 For servers with an application-level heartbeat, set `ping_enabled(false)`: no ping
 frames are sent and no keep-alive timer runs. The consumer then sends its own
 heartbeat messages and requests `HandlerAction::Reconnect` (or sends `Reconnect`) when
 the server stops answering.
 
 ## Send queue
+
+`SendText` / `SendBinary` resolve with `Ok` once the message is written to the socket.
+That is not a delivery guarantee: a message can still be lost if the connection
+breaks before the server read it.
 
 Messages are queued while the socket cannot take them as fast as they are sent. By
 default the queue is unbounded. With `max_send_queue(n)`, at most `n` messages wait in
@@ -291,7 +302,7 @@ stay out of the log.
 
 `on_connected` / `on_disconnected` are **edge-triggered and balanced**: `on_connected`
 fires exactly once per established connection, `on_disconnected` exactly once when
-that connection ends — never duplicated, never unpaired (P2-3). A failed connect
+that connection ends — never duplicated, never unpaired. A failed connect
 attempt emits `on_error`, not `on_disconnected`. `SendText` / `SendBinary` while not
 connected fail immediately with `Error::NotConnected`.
 
@@ -320,6 +331,10 @@ directly before `on_disconnected`:
 | `KeepAliveTimeout`                | The server stopped answering pings                       |
 | `Error(error)`                    | Read or write failure: network error (`Error::Io` with its kind), TLS error, protocol violation. `on_error` is called before |
 | `StreamEnded`                     | The server closed the connection without a close frame: process ended, device restarted. No `on_error` |
+
+The transport validates the close frame of the server: a status code that must not
+be sent in a close frame (RFC 6455 §7.4) is reported as 1002 (protocol error), not as
+the code the server sent.
 
 The reconnect policy does not depend on the reason: after a server close the client
 reconnects as before. A consumer that must not reconnect after a specific status
@@ -413,9 +428,10 @@ in any case) or a reference relative to the current URL: `//host/path`, `/path`,
 
 | Layer             | Location                      | Covers                                                                                                                         |
 |-------------------|-------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
-| Pure unit tests   | `src/core/*` (`#[cfg(test)]`) | All state transitions, generation filtering, keep-alive budget, backoff math, flapping protection, callback balance            |
+| Pure unit tests   | `src/core/*` (`#[cfg(test)]`) | All state transitions, generation filtering, keep-alive budget, backoff math, flapping protection, callback balance; invariants over random event sequences |
 | Connection task   | `src/actor/connection.rs` tests | Teardown of a connection against mock transport halves: abort, close handshake, close timeout, stalled socket                |
 | Actor integration | `src/actor/mod.rs` tests      | Effect wiring against a mock `Transport` (no TCP): reconnect, disconnect during reconnect, write-failure recovery, close frame |
+| Connecting        | `src/actor/tcp.rs`, `src/actor/transport.rs` tests | Racing the addresses of a host with scripted addresses and a paused clock; redirects, header forwarding, URL validation |
 | End-to-end        | `tests/e2e.rs`                | Real local server: echo roundtrip, close handshake, ping/pong, HTTP redirect, unreachable host                                 |
 | End-to-end TLS    | `tests/tls.rs`                | Real local `wss://` server with a private CA: rejection of an untrusted certificate, trusted roots, disabled verification, ready-made connectors |
 

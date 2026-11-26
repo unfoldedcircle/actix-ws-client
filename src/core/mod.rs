@@ -632,7 +632,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Regression 1 (P0-1): stale writer events are ignored
+    // Stale writer events are ignored
     // ------------------------------------------------------------------
 
     #[test]
@@ -671,7 +671,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Regression 2 (P0-2): stale reader end must not tear down gen 2
+    // A stale end of the reader must not tear down generation 2
     // ------------------------------------------------------------------
 
     #[test]
@@ -758,7 +758,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Regression 3 (P1-1): keep-alive budget
+    // Keep-alive budget
     // ------------------------------------------------------------------
 
     #[test]
@@ -878,7 +878,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Regression 4 (P1-2): flapping connection grows backoff; stable resets
+    // A flapping connection grows the backoff; a stable one resets it
     // ------------------------------------------------------------------
 
     #[test]
@@ -953,7 +953,7 @@ mod tests {
             },
             now,
         );
-        // first retry uses the configured initial backoff (P2-2 off-by-one)
+        // first retry uses the configured initial backoff (no off-by-one)
         assert_eq!(reconnect_delay(&effects), Some(INITIAL_BACKOFF));
         assert!(effects.contains(&Effect::CompleteConnect {
             result: Err(Error::ConnectTimeout)
@@ -1016,7 +1016,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Callback contract (P2-3): edge-triggered and balanced
+    // Callback contract: edge-triggered and balanced
     // ------------------------------------------------------------------
 
     #[test]
@@ -1516,7 +1516,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Maximum reconnection attempts (§5.2)
+    // Maximum reconnection attempts
     // ------------------------------------------------------------------
 
     /// Machine with a reconnection attempt cap.

@@ -13,11 +13,11 @@ use actix_ws_client::{
 use futures::{SinkExt, StreamExt};
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, date_time_ymd,
+    KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -51,15 +51,12 @@ struct TlsServer {
     ca_pem: String,
 }
 
-/// Validity of the test certificates: the current and the next year. Platform
-/// verifiers reject server certificates with a long validity period.
-fn validity() -> (i32, i32) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let year = 1970 + (secs / 31_556_952) as i32;
-    (year, year + 1)
+/// Validity of the test certificates: from yesterday for 30 days. Platform verifiers
+/// reject server certificates with a long validity period.
+fn validity() -> (SystemTime, SystemTime) {
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    let now = SystemTime::now();
+    (now - DAY, now + 30 * DAY)
 }
 
 async fn spawn_tls_echo_server() -> TlsServer {
@@ -70,14 +67,14 @@ async fn spawn_tls_echo_server() -> TlsServer {
 async fn spawn_tls_echo_server_with(
     versions: &[&'static rustls::SupportedProtocolVersion],
 ) -> TlsServer {
-    let (from_year, to_year) = validity();
+    let (not_before, not_after) = validity();
 
     let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    ca_params.not_before = date_time_ymd(from_year, 1, 1);
-    ca_params.not_after = date_time_ymd(to_year, 12, 31);
+    ca_params.not_before = not_before.into();
+    ca_params.not_after = not_after.into();
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "actix-ws-client test CA");
@@ -88,8 +85,8 @@ async fn spawn_tls_echo_server_with(
     let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    server_params.not_before = date_time_ymd(from_year, 1, 1);
-    server_params.not_after = date_time_ymd(to_year, 12, 31);
+    server_params.not_before = not_before.into();
+    server_params.not_after = not_after.into();
     let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -386,13 +383,13 @@ async fn tls12_only_server_is_supported() {
 
 /// The PEM of a certificate authority that has nothing to do with the server.
 fn unrelated_ca_pem() -> String {
-    let (from_year, to_year) = validity();
+    let (not_before, not_after) = validity();
     let key = KeyPair::generate().unwrap();
     let mut params = CertificateParams::new(Vec::new()).unwrap();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params.not_before = date_time_ymd(from_year, 1, 1);
-    params.not_after = date_time_ymd(to_year, 12, 31);
+    params.not_before = not_before.into();
+    params.not_after = not_after.into();
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "unrelated test CA");
