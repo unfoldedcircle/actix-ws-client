@@ -156,8 +156,8 @@ pub struct WebSocketConfig {
     /// sent (slow network or peer). With a limit, a message that does not fit is
     /// rejected with [`crate::Error::SendQueueFull`] instead of growing the queue —
     /// useful for streamed data such as audio, where stale data is worthless.
-    /// Internal control frames (ping, close) are never rejected, but they take a
-    /// place in the queue while they wait.
+    /// Keep-alive pings do not use the queue: they are written before the messages
+    /// that wait in it. A close frame is never rejected.
     ///
     /// The limit counts messages, not bytes, and not the message that is being
     /// written. `None` (default) does not limit the queue: it then grows for as long

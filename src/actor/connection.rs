@@ -27,12 +27,14 @@ use crate::actor::reader::{ReaderEvent, run_reader};
 use crate::actor::transport::{BoxSink, BoxStream};
 use crate::actor::writer::{WriteItem, run_writer};
 use crate::core::effect::Teardown;
+use bytes::Bytes;
 use log::debug;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 /// Number of events the connection task may have waiting for the actor.
 const EVENT_QUEUE: usize = 32;
@@ -49,6 +51,8 @@ pub(crate) enum ConnectionEvent {
 /// The actor's side of a running connection task.
 pub(crate) struct ConnectionHandle {
     writes: mpsc::UnboundedSender<WriteItem>,
+    // Keep-alive pings: written before the messages waiting in `writes`.
+    pings: mpsc::UnboundedSender<Message>,
     // Number of messages waiting in the write queue.
     queued: Arc<AtomicUsize>,
     shutdown: oneshot::Sender<Teardown>,
@@ -67,6 +71,7 @@ impl ConnectionHandle {
         close_timeout: Duration,
     ) -> (Self, mpsc::Receiver<ConnectionEvent>) {
         let (writes_tx, writes_rx) = mpsc::unbounded_channel();
+        let (pings_tx, pings_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (closed_tx, closed_rx) = watch::channel(());
@@ -76,6 +81,7 @@ impl ConnectionHandle {
             sink,
             stream,
             writes: writes_rx,
+            pings: pings_rx,
             queued: queued.clone(),
             events: events_tx,
             shutdown: shutdown_rx,
@@ -84,6 +90,7 @@ impl ConnectionHandle {
         }));
         let handle = Self {
             writes: writes_tx,
+            pings: pings_tx,
             queued,
             shutdown: shutdown_tx,
             closed: Closed(closed_rx),
@@ -98,6 +105,13 @@ impl ConnectionHandle {
             self.queued.fetch_add(1, Ordering::Relaxed);
         }
         enqueued
+    }
+
+    /// Sends a keep-alive ping. It does not wait in the queue, and does not count
+    /// for its length.
+    pub(crate) fn ping(&self, payload: Bytes) {
+        // Without a writer there is nobody to ping.
+        let _ = self.pings.send(Message::Ping(payload));
     }
 
     /// Number of messages waiting to be written.
@@ -139,6 +153,7 @@ struct ConnectionTask {
     sink: BoxSink,
     stream: BoxStream,
     writes: mpsc::UnboundedReceiver<WriteItem>,
+    pings: mpsc::UnboundedReceiver<Message>,
     queued: Arc<AtomicUsize>,
     events: mpsc::Sender<ConnectionEvent>,
     shutdown: oneshot::Receiver<Teardown>,
@@ -154,6 +169,7 @@ async fn run_connection(task: ConnectionTask) {
         sink,
         stream,
         writes,
+        pings,
         queued,
         events,
         mut shutdown,
@@ -163,7 +179,7 @@ async fn run_connection(task: ConnectionTask) {
 
     let write_events = events.clone();
     let mut writer = Some(Box::pin(async move {
-        if let Some(error) = run_writer(sink, writes, queued).await {
+        if let Some(error) = run_writer(sink, writes, pings, queued).await {
             let _ = write_events.send(ConnectionEvent::WriteFailed(error)).await;
         }
     }));
@@ -233,7 +249,6 @@ mod tests {
     };
     use crate::core::event::Frame;
     use std::sync::atomic::Ordering::SeqCst;
-    use tokio_tungstenite::tungstenite::protocol::Message;
 
     const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -297,6 +312,28 @@ mod tests {
             events.recv().await,
             Some(ConnectionEvent::WriteFailed(Error::WebSocket(_)))
         ));
+    }
+
+    /// A failed write empties the queue: its length must not stay at the old value
+    /// and make the queue look full.
+    #[actix_rt::test]
+    async fn write_failure_empties_the_queue() {
+        let (sink, _sent) = mock_sink(0);
+        let (_script, stream) = scripted_stream();
+        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, CLOSE_TIMEOUT);
+
+        let (first, first_result) = item(text("fails"));
+        let (second, second_result) = item(text("queued"));
+        let (third, third_result) = item(text("queued"));
+        handle.enqueue(first);
+        handle.enqueue(second);
+        handle.enqueue(third);
+        assert_eq!(handle.queue_len(), 3);
+
+        assert!(first_result.await.unwrap().is_err());
+        assert_eq!(second_result.await.unwrap(), Err(Error::NotConnected));
+        assert_eq!(third_result.await.unwrap(), Err(Error::NotConnected));
+        assert_eq!(handle.queue_len(), 0);
     }
 
     #[actix_rt::test]

@@ -59,6 +59,9 @@ _Changes in the next release_
   `SendText` / `SendBinary` request that failed.
 
 ### Fixed
+- A keep-alive ping is written before the messages waiting in the send queue. Before, a backlog on a slow connection
+  could delay the ping until the keep-alive timeout dropped a working connection.
+- The length of the send queue is reset after a failed write.
 - Message contents are no longer logged at trace level, where they bypassed the `redact_trace` hook: the size is
   logged instead.
 - URLs in log lines and error texts no longer contain user info, query and fragment.
