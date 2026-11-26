@@ -4,6 +4,7 @@
 use super::transport::{BoxSink, BoxStream, ConnectFuture, ConnectOptions, Transport};
 use crate::Error;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,6 +70,51 @@ pub(crate) fn failing_sink(
 /// The error of a write to a socket the server closed.
 pub(crate) fn broken_pipe() -> WsError {
     WsError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+}
+
+/// Sink of a slow connection: every message takes `delay` to write.
+struct SlowSink {
+    sent: Arc<Mutex<Vec<Message>>>,
+    delay: std::time::Duration,
+    writing: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl futures::Sink<Message> for SlowSink {
+    type Error = WsError;
+
+    fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), WsError> {
+        self.sent.lock().unwrap().push(item);
+        self.writing = Some(Box::pin(tokio::time::sleep(self.delay)));
+        Ok(())
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+        if let Some(writing) = self.writing.as_mut() {
+            futures::ready!(writing.as_mut().poll(cx));
+            self.writing = None;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Creates a recording sink that takes `delay` to write a message. The message is
+/// recorded when its write starts.
+pub(crate) fn slow_sink(delay: std::time::Duration) -> (BoxSink, Arc<Mutex<Vec<Message>>>) {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let sink = SlowSink {
+        sent: sent.clone(),
+        delay,
+        writing: None,
+    };
+    (Box::pin(sink), sent)
 }
 
 /// Sink that never becomes ready: every write blocks forever (stalled socket).

@@ -299,6 +299,28 @@ mod tests {
         ));
     }
 
+    /// A failed write empties the queue: its length must not stay at the old value
+    /// and make the queue look full.
+    #[actix_rt::test]
+    async fn write_failure_empties_the_queue() {
+        let (sink, _sent) = mock_sink(0);
+        let (_script, stream) = scripted_stream();
+        let (handle, _events) = ConnectionHandle::spawn("test", sink, stream, CLOSE_TIMEOUT);
+
+        let (first, first_result) = item(text("fails"));
+        let (second, second_result) = item(text("queued"));
+        let (third, third_result) = item(text("queued"));
+        handle.enqueue(first);
+        handle.enqueue(second);
+        handle.enqueue(third);
+        assert_eq!(handle.queue_len(), 3);
+
+        assert!(first_result.await.unwrap().is_err());
+        assert_eq!(second_result.await.unwrap(), Err(Error::NotConnected));
+        assert_eq!(third_result.await.unwrap(), Err(Error::NotConnected));
+        assert_eq!(handle.queue_len(), 0);
+    }
+
     #[actix_rt::test]
     async fn abort_drops_a_stalled_connection_and_fails_its_messages() {
         let (sink, sink_dropped) = track_sink(blocked_sink());

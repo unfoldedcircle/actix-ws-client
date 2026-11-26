@@ -751,7 +751,7 @@ impl<H: WebSocketMessageHandler> Handler<SendBinary> for GenericWebSocketClient<
 mod tests {
     use super::testutil::{
         MockTransport, blocked_sink, broken_pipe, captured_logs, failing_sink, mock_sink,
-        scripted_stream, track_sink, track_stream,
+        scripted_stream, slow_sink, track_sink, track_stream,
     };
     use super::*;
     use crate::{DisconnectReason, WebSocketConfig};
@@ -2399,5 +2399,62 @@ mod tests {
         assert!(!error.to_string().contains("token-4712"), "{error}");
         assert_eq!(logged("token-4712"), Vec::<String>::new());
         addr.do_send(Disconnect);
+    }
+
+    // ------------------------------------------------------------------
+    // Keep-alive on a busy connection
+    // ------------------------------------------------------------------
+
+    /// A ping must not wait behind the messages of the application: on a slow
+    /// connection with a backlog, it would reach the server too late to be answered
+    /// in time, and a working connection would be dropped.
+    #[actix_rt::test]
+    async fn keep_alive_ping_does_not_wait_behind_queued_messages() {
+        tokio::time::pause();
+        // The connection takes 100 ms per message.
+        let (sink, sent) = slow_sink(Duration::from_millis(100));
+        let (_script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let config = WebSocketConfig::builder()
+            .ping_interval(Duration::from_secs(1))
+            .max_missed_pongs(10u32)
+            .build()
+            .unwrap();
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            "ws://localhost",
+            config,
+            TestHandler::default(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .start();
+        addr.send(Connect).await.unwrap().unwrap();
+
+        // A backlog of 5 seconds.
+        for i in 0..50 {
+            addr.do_send(SendText::new(format!("message {i}")));
+        }
+        // The first ping is due after 1 second, with 40 messages still waiting.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let sent = sent.lock().unwrap();
+        let ping = sent.iter().position(|m| matches!(m, Message::Ping(_)));
+        assert!(
+            ping.is_some_and(|position| position <= 11),
+            "the ping must be written as soon as the message in flight is out, \
+             ping at {ping:?} of {} written messages",
+            sent.len()
+        );
+        // The messages of the application keep their order.
+        let texts: Vec<_> = sent
+            .iter()
+            .filter_map(|m| match m {
+                Message::Text(text) => Some(text.as_str().to_owned()),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<_> = (0..texts.len()).map(|i| format!("message {i}")).collect();
+        assert_eq!(texts, expected);
     }
 }
