@@ -30,17 +30,20 @@ pub(crate) fn backoff(attempt: u32, cfg: &BackoffCfg, jitter: f64) -> Duration {
     } else {
         1.0
     };
-    let initial_ms = cfg.initial.as_secs_f64() * 1000.0;
-    let max_ms = cfg.max.as_secs_f64() * 1000.0;
+    let max = cfg.max.as_secs_f64();
 
-    // Cap the exponent computation itself: factor^exponent can overflow f64 range for
-    // large attempt counts; `min` against max_ms afterwards handles the +inf case too.
-    let delay_ms = (initial_ms * factor.powi(exponent.min(i32::MAX as u32) as i32)).min(max_ms);
+    // factor^exponent can exceed the f64 range for large attempt counts: `min`
+    // against the cap handles infinity, and NaN as well.
+    let growth = factor.powi(exponent.min(i32::MAX as u32) as i32);
+    let delay = (cfg.initial.as_secs_f64() * growth).min(max);
 
     let jitter = jitter.clamp(0.0, 1.0);
-    let jittered_ms = delay_ms * (1.0 - jitter * JITTER_MAGNITUDE);
+    let jittered = delay * (1.0 - jitter * JITTER_MAGNITUDE);
 
-    Duration::from_millis(jittered_ms as u64)
+    // The conversion only fails at the upper limit of `Duration`, where f64 rounds up.
+    Duration::try_from_secs_f64(jittered)
+        .unwrap_or(cfg.max)
+        .min(cfg.max)
 }
 
 #[cfg(test)]
@@ -116,5 +119,36 @@ mod tests {
             factor: 0.5,
         };
         assert_eq!(backoff(5, &cfg, 0.0), Duration::from_millis(500));
+    }
+
+    /// The delay must not be cut to whole milliseconds: a short delay became zero.
+    #[test]
+    fn sub_millisecond_delay_is_kept() {
+        let cfg = BackoffCfg {
+            initial: Duration::from_micros(500),
+            max: Duration::from_secs(30),
+            factor: 2.0,
+        };
+        assert_eq!(backoff(1, &cfg, 0.0), Duration::from_micros(500));
+        assert_eq!(backoff(2, &cfg, 0.0), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn extreme_values_do_not_overflow() {
+        let cfg = BackoffCfg {
+            initial: Duration::MAX,
+            max: Duration::MAX,
+            factor: f64::MAX,
+        };
+        for attempt in [1, 2, u32::MAX] {
+            let delay = backoff(attempt, &cfg, 0.0);
+            assert!(delay > Duration::from_secs(u64::MAX / 2));
+        }
+        let cfg = BackoffCfg {
+            initial: Duration::from_millis(500),
+            max: Duration::from_secs(30),
+            factor: f64::MAX,
+        };
+        assert_eq!(backoff(u32::MAX, &cfg, 0.0), cfg.max);
     }
 }
