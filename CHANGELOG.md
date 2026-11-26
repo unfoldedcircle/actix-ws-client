@@ -47,7 +47,12 @@ _Changes in the next release_
   other than `ws` / `wss`, a missing host, or `wss` without a TLS backend. Before, every connection attempt failed
   and was retried forever.
 
+- The configuration builder rejects values that make the client spin or never connect: an `initial_backoff` below
+  1 ms, a `max_backoff` below `initial_backoff`, a zero `connect_timeout`, zero size limits and a `max_frame_size`
+  above `max_message_size`.
+
 ### Fixed
+- The reconnect delay is no longer cut to whole milliseconds.
 - A header with several values keeps all of them on a redirect and on a URL refresh. Before, only the first value
   was kept.
 - A host name with an address that does not answer, typically IPv6 without a route, no longer uses up the whole

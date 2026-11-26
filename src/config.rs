@@ -6,6 +6,11 @@ use crate::tls::TlsConnector;
 use derive_builder::Builder;
 use std::time::Duration;
 
+const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Shortest accepted reconnect delay: anything below makes the client spin.
+const MIN_BACKOFF: Duration = Duration::from_millis(1);
+
 /// Configuration for WebSocket connection, reconnection and keep-alive handling.
 ///
 /// Use [`WebSocketConfig::builder()`] to create a new configuration.
@@ -55,7 +60,7 @@ pub struct WebSocketConfig {
 
     /// Timeout for a single connection attempt (including redirects).
     ///
-    /// Default is 10 seconds.
+    /// Must not be zero. Default is 10 seconds.
     #[builder(default = "Duration::from_secs(10)")]
     pub(crate) connect_timeout: Duration,
 
@@ -97,14 +102,14 @@ pub struct WebSocketConfig {
 
     /// The initial backoff duration for the retry connection logic.
     ///
-    /// Default is 500 milliseconds.
-    #[builder(default = "Duration::from_millis(500)")]
+    /// Must be at least 1 millisecond. Default is 500 milliseconds.
+    #[builder(default = "DEFAULT_INITIAL_BACKOFF")]
     pub(crate) initial_backoff: Duration,
 
     /// The maximum backoff duration for the retry connection logic.
     ///
-    /// Default is 30 seconds.
-    #[builder(default = "Duration::from_secs(30)")]
+    /// Must not be below `initial_backoff`. Default is 30 seconds.
+    #[builder(default = "DEFAULT_MAX_BACKOFF")]
     pub(crate) max_backoff: Duration,
 
     /// The factor by which the backoff duration is multiplied after each failed attempt.
@@ -127,13 +132,21 @@ pub struct WebSocketConfig {
     /// The maximum size of an incoming message (complete payload, possibly multiple
     /// frames).
     ///
-    /// `None` (default) uses the transport default of 64 MiB.
+    /// A larger message is not delivered: the connection is dropped with an error and
+    /// the client reconnects. The limit also bounds the memory a single message of the
+    /// server can take. A text message is copied once when it is delivered, so it
+    /// takes up to twice its size for a moment.
+    ///
+    /// Must not be zero. `None` (default) uses the transport default of 64 MiB, which
+    /// is generous for a device with little memory: set a limit that fits the
+    /// largest message of the application.
     #[builder(default)]
     pub(crate) max_message_size: Option<usize>,
 
     /// The maximum size of a single incoming message frame payload.
     ///
-    /// `None` (default) uses the transport default of 16 MiB.
+    /// Must not be zero, and not above `max_message_size` if both are set. `None`
+    /// (default) uses the transport default of 16 MiB.
     #[builder(default)]
     pub(crate) max_frame_size: Option<usize>,
 
@@ -143,9 +156,14 @@ pub struct WebSocketConfig {
     /// sent (slow network or peer). With a limit, a message that does not fit is
     /// rejected with [`crate::Error::SendQueueFull`] instead of growing the queue —
     /// useful for streamed data such as audio, where stale data is worthless.
-    /// Internal control frames (ping, pong, close) are never rejected.
+    /// Internal control frames (ping, close) are never rejected, but they take a
+    /// place in the queue while they wait.
     ///
-    /// `None` (default) does not limit the queue.
+    /// The limit counts messages, not bytes, and not the message that is being
+    /// written. `None` (default) does not limit the queue: it then grows for as long
+    /// as the application sends faster than the socket takes the data. The queue is
+    /// dropped with its connection — for example when the keep-alive timeout ends a
+    /// connection that stopped taking data.
     #[builder(default)]
     pub(crate) max_send_queue: Option<usize>,
 
@@ -246,10 +264,38 @@ impl WebSocketConfigBuilder {
         if self.max_send_queue == Some(Some(0)) {
             return Err("max_send_queue must be >= 1".into());
         }
-        if let Some(initial) = self.initial_backoff
-            && initial.is_zero()
+        // Without a delay between the attempts the client spins.
+        let initial = self.initial_backoff.unwrap_or(DEFAULT_INITIAL_BACKOFF);
+        let max = self.max_backoff.unwrap_or(DEFAULT_MAX_BACKOFF);
+        if initial < MIN_BACKOFF {
+            return Err(format!(
+                "initial_backoff must be at least {MIN_BACKOFF:?}, got {initial:?}"
+            ));
+        }
+        if max < initial {
+            return Err(format!(
+                "max_backoff ({max:?}) must not be below initial_backoff ({initial:?})"
+            ));
+        }
+        if let Some(timeout) = self.connect_timeout
+            && timeout.is_zero()
         {
-            return Err("initial_backoff must be > 0".into());
+            return Err("connect_timeout must be > 0".into());
+        }
+        // A limit of zero rejects every message.
+        if self.max_message_size == Some(Some(0)) {
+            return Err("max_message_size must be >= 1".into());
+        }
+        if self.max_frame_size == Some(Some(0)) {
+            return Err("max_frame_size must be >= 1".into());
+        }
+        if let (Some(Some(frame)), Some(Some(message))) =
+            (self.max_frame_size, self.max_message_size)
+            && frame > message
+        {
+            return Err(format!(
+                "max_frame_size ({frame}) must not exceed max_message_size ({message})"
+            ));
         }
         #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
         if matches!(self.tls_connector, Some(Some(_)))

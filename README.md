@@ -351,8 +351,28 @@ with `HandlerAction::Reconnect`.
 | `msg_tracing_out`   | false   | Log sent text messages at debug level (with ms since previous send) |
 
 The former `pong_timeout` knob was removed: with tick-based keep-alive it had no
-effect. The builder validates `backoff_factor >= 1.0`, `max_missed_pongs >= 1` and
-non-zero `ping_interval` / `initial_backoff` / `max_send_queue`.
+effect.
+
+The builder rejects values that cannot work, instead of a client that spins or never
+connects:
+
+- `backoff_factor` below 1.0, `initial_backoff` below 1 ms, `max_backoff` below
+  `initial_backoff`
+- zero `connect_timeout`, `ping_interval`, `max_missed_pongs` or `max_send_queue`
+- zero `max_message_size` or `max_frame_size`, and a `max_frame_size` above
+  `max_message_size`
+
+### Memory limits
+
+The defaults do not limit memory tightly. On a device with little memory, set limits
+that fit the application:
+
+- **Inbound.** A single message can take up to `max_message_size` (default 64 MiB),
+  a text message twice that for a moment. A larger message drops the connection.
+  Received messages do not pile up: a slow handler slows down reading.
+- **Outbound.** `max_send_queue` is unlimited by default. The queue grows while the
+  application sends faster than the socket takes the data, and is dropped with its
+  connection. The limit counts messages, not bytes.
 
 Redirects support absolute, scheme-relative and absolute-path `Location` values.
 
