@@ -78,11 +78,19 @@ pub enum HandlerAction {
 ///
 /// # Actions
 ///
-/// `on_text`, `on_binary` and `on_connected` return a list of [`HandlerAction`]s that
-/// the client executes in order right after the callback returns. Return an empty
-/// `Vec` when nothing should happen. Send actions returned while the connection is no
-/// longer up (e.g. after a `Disconnect` action in the same batch) are dropped with a
-/// warning.
+/// Most callbacks return a list of [`HandlerAction`]s that the client executes in
+/// order right after the callback returns. Return an empty `Vec` when nothing should
+/// happen. Send actions returned while the connection is not up (after a `Disconnect`
+/// action in the same batch, or from `on_closed`, `on_error` and
+/// `on_reconnect_exhausted`) are dropped with a warning.
+///
+/// This is also how a handler decides about reconnecting. The client reconnects after
+/// every failure, whatever its cause: return [`HandlerAction::Disconnect`] from
+/// `on_error` or `on_closed` to stop when retrying is pointless — the server rejected
+/// the credentials, or closed with a status that means "do not come back". The action
+/// cancels the reconnect that is already scheduled.
+///
+/// Actions are ignored while the client stops.
 ///
 /// # Callback contract
 ///
@@ -109,15 +117,28 @@ pub trait WebSocketMessageHandler: Send + Unpin + 'static {
     /// [`WebSocketMessageHandler::on_disconnected`].
     ///
     /// Use it to react to the server's close status code, e.g. to stop reconnecting
-    /// with a [`crate::Disconnect`] message after an application-specific code.
+    /// with [`HandlerAction::Disconnect`] after an application-specific code.
+    ///
+    /// The default implementation does nothing.
     #[allow(unused_variables)]
-    fn on_closed(&mut self, reason: &DisconnectReason) {}
+    fn on_closed(&mut self, reason: &DisconnectReason) -> Vec<HandlerAction> {
+        Vec::new()
+    }
 
     /// Called when the connection is lost or closed.
     fn on_disconnected(&mut self) {}
-    /// Called when an error occurs.
+    /// Called when an error occurs: a connection attempt failed, or reading from or
+    /// writing to an established connection failed.
+    ///
+    /// The client reconnects afterwards according to its reconnect policy. Return
+    /// [`HandlerAction::Disconnect`] to stop instead, e.g. after
+    /// [`Error::Http`] with status 401 or a rejected certificate ([`Error::Tls`]).
+    ///
+    /// The default implementation does nothing.
     #[allow(unused_variables)]
-    fn on_error(&mut self, error: &Error) {}
+    fn on_error(&mut self, error: &Error) -> Vec<HandlerAction> {
+        Vec::new()
+    }
     /// Called before a text message is logged by message tracing
     /// ([`crate::WebSocketConfig`] `msg_tracing_in` / `msg_tracing_out`), to keep
     /// secrets out of the log.
@@ -136,6 +157,11 @@ pub trait WebSocketMessageHandler: Send + Unpin + 'static {
     /// ([`crate::WebSocketConfig`] `max_reconnect_attempts`) has been reached.
     ///
     /// The client stops reconnecting; a new [`crate::Connect`] or [`crate::Reconnect`]
-    /// message starts a fresh attempt sequence.
-    fn on_reconnect_exhausted(&mut self) {}
+    /// message, or a returned [`HandlerAction::Reconnect`], starts a fresh attempt
+    /// sequence.
+    ///
+    /// The default implementation does nothing.
+    fn on_reconnect_exhausted(&mut self) -> Vec<HandlerAction> {
+        Vec::new()
+    }
 }

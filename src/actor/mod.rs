@@ -258,6 +258,10 @@ where
             self.machine.state(),
             self.machine.generation()
         );
+        // A stopping client only closes its connection: it must not send or connect.
+        if matches!(ctx.state(), ActorState::Stopping | ActorState::Stopped) {
+            return;
+        }
         for action in pending_actions {
             self.execute_action(action, ctx);
         }
@@ -549,8 +553,7 @@ where
             }
             Callback::OnClosed(reason) => {
                 debug!("[{}] Connection closed: {reason:?}", self.id);
-                self.handler.on_closed(&reason);
-                Vec::new()
+                self.handler.on_closed(&reason)
             }
             Callback::OnDisconnected => {
                 info!("[{}] Disconnected", self.id);
@@ -559,13 +562,11 @@ where
             }
             Callback::OnError(error) => {
                 info!("[{}] Error: {error}", self.id);
-                self.handler.on_error(&error);
-                Vec::new()
+                self.handler.on_error(&error)
             }
             Callback::OnReconnectExhausted => {
                 warn!("[{}] Reconnection attempts exhausted, giving up", self.id);
-                self.handler.on_reconnect_exhausted();
-                Vec::new()
+                self.handler.on_reconnect_exhausted()
             }
         }
     }
@@ -745,6 +746,12 @@ mod tests {
         text_actions: Arc<Mutex<Vec<HandlerAction>>>,
         /// Actions returned (and drained) by the next `on_connected` call.
         connected_actions: Arc<Mutex<Vec<HandlerAction>>>,
+        /// Actions returned (and drained) by the next `on_closed` call.
+        closed_actions: Arc<Mutex<Vec<HandlerAction>>>,
+        /// Actions returned (and drained) by the next `on_error` call.
+        error_actions: Arc<Mutex<Vec<HandlerAction>>>,
+        /// Actions returned (and drained) by the next `on_reconnect_exhausted` call.
+        exhausted_actions: Arc<Mutex<Vec<HandlerAction>>>,
     }
 
     impl TestHandler {
@@ -786,17 +793,20 @@ mod tests {
             self.log.lock().unwrap().push("connected".into());
             std::mem::take(&mut *self.connected_actions.lock().unwrap())
         }
-        fn on_closed(&mut self, reason: &DisconnectReason) {
+        fn on_closed(&mut self, reason: &DisconnectReason) -> Vec<HandlerAction> {
             self.log.lock().unwrap().push(format!("closed:{reason:?}"));
+            std::mem::take(&mut *self.closed_actions.lock().unwrap())
         }
         fn on_disconnected(&mut self) {
             self.log.lock().unwrap().push("disconnected".into());
         }
-        fn on_error(&mut self, error: &Error) {
+        fn on_error(&mut self, error: &Error) -> Vec<HandlerAction> {
             self.log.lock().unwrap().push(format!("error:{error}"));
+            std::mem::take(&mut *self.error_actions.lock().unwrap())
         }
-        fn on_reconnect_exhausted(&mut self) {
+        fn on_reconnect_exhausted(&mut self) -> Vec<HandlerAction> {
             self.log.lock().unwrap().push("exhausted".into());
+            std::mem::take(&mut *self.exhausted_actions.lock().unwrap())
         }
         fn redact_trace<'a>(
             &self,
@@ -2084,5 +2094,141 @@ mod tests {
 
         assert!(actor_stopped(&handler));
         assert_eq!(attempts.lock().unwrap().len(), attempts_at_stop);
+    }
+
+    // ------------------------------------------------------------------
+    // Actions of on_error, on_closed and on_reconnect_exhausted
+    // ------------------------------------------------------------------
+
+    #[actix_rt::test]
+    async fn disconnect_from_on_error_stops_reconnecting() {
+        tokio::time::pause();
+        let (transport, attempts) = MockTransport::scripted(vec![Err(Error::Http { status: 401 })]);
+        let handler = TestHandler::default();
+        // Retrying with rejected credentials is pointless.
+        *handler.error_actions.lock().unwrap() = vec![HandlerAction::Disconnect];
+        let addr = client(transport, handler.clone());
+
+        let result = addr.send(Connect).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        assert_eq!(result, Err(Error::Http { status: 401 }));
+        assert_eq!(
+            attempts.lock().unwrap().len(),
+            1,
+            "the scheduled reconnect must be cancelled"
+        );
+        assert_eq!(handler.count("exhausted"), 0);
+        // The client is usable: a new request connects again.
+        assert!(addr.send(Connect).await.unwrap().is_err());
+        assert_eq!(attempts.lock().unwrap().len(), 2);
+    }
+
+    #[actix_rt::test]
+    async fn disconnect_from_on_closed_stops_reconnecting_after_a_server_close() {
+        tokio::time::pause();
+        let (sink, _sent) = mock_sink(usize::MAX);
+        let (script, stream) = scripted_stream();
+        let (transport, attempts) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        *handler.closed_actions.lock().unwrap() = vec![HandlerAction::Disconnect];
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        // An application status that means "do not come back".
+        script
+            .unbounded_send(Ok(Message::Close(Some(CloseFrame {
+                code: CloseCode::from(4001),
+                reason: "access revoked".into(),
+            }))))
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        assert!(handler.log_contains(
+            "closed:ClosedByServer { code: Some(4001), reason: \"access revoked\" }"
+        ));
+        assert_eq!(handler.count("disconnected"), 1);
+        assert_eq!(attempts.lock().unwrap().len(), 1, "no reconnect");
+        assert!(!addr.send(IsConnected).await.unwrap());
+    }
+
+    #[actix_rt::test]
+    async fn reconnect_from_on_reconnect_exhausted_starts_a_fresh_sequence() {
+        tokio::time::pause();
+        let (sink, _sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, attempts) = MockTransport::scripted(vec![
+            Err(Error::WebSocket("refused".into())),
+            Err(Error::WebSocket("refused".into())),
+            Ok((sink, stream)),
+        ]);
+        let handler = TestHandler::default();
+        *handler.exhausted_actions.lock().unwrap() = vec![HandlerAction::Reconnect];
+        let config = WebSocketConfig::builder()
+            .max_reconnect_attempts(1u32)
+            .build()
+            .unwrap();
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            "ws://localhost",
+            config,
+            handler.clone(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .start();
+
+        assert!(addr.send(Connect).await.unwrap().is_err());
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        // Initial attempt and one retry failed: exhausted, then the handler's retry.
+        assert_eq!(handler.count("exhausted"), 1);
+        assert_eq!(attempts.lock().unwrap().len(), 3);
+        assert!(addr.send(IsConnected).await.unwrap());
+    }
+
+    #[actix_rt::test]
+    async fn send_actions_without_a_connection_are_dropped() {
+        tokio::time::pause();
+        let (transport, attempts) =
+            MockTransport::scripted(vec![Err(Error::WebSocket("refused".into()))]);
+        let handler = TestHandler::default();
+        *handler.error_actions.lock().unwrap() =
+            vec![HandlerAction::SendText("nobody to send to".into())];
+        let addr = client(transport, handler.clone());
+
+        assert!(addr.send(Connect).await.unwrap().is_err());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // The reconnect policy is not affected: the client keeps retrying.
+        assert_eq!(attempts.lock().unwrap().len(), 1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(attempts.lock().unwrap().len() > 1);
+        assert!(!addr.send(IsConnected).await.unwrap());
+        addr.do_send(Disconnect);
+    }
+
+    #[actix_rt::test]
+    async fn actions_of_a_stopping_client_are_ignored() {
+        tokio::time::pause();
+        let (sink, _sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, attempts) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        // The handler always wants a new connection when one closes.
+        *handler.closed_actions.lock().unwrap() = vec![HandlerAction::Reconnect];
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        drop(addr);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        assert!(handler.log_contains("closed:ClosedLocally"));
+        assert!(actor_stopped(&handler));
+        assert_eq!(
+            attempts.lock().unwrap().len(),
+            1,
+            "a stopped client stays stopped"
+        );
     }
 }
