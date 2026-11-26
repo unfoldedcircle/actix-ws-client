@@ -38,7 +38,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig as WsProtocolConfig;
 use transport::{
     BoxSink, BoxStream, ConnectOptions, Transport, TungsteniteTransport, copy_headers,
-    message_from_frame, validate_close,
+    message_from_frame, validate_close, validate_request,
 };
 use writer::WriteItem;
 
@@ -146,6 +146,12 @@ where
     /// * `request` - The WebSocket URL or request to connect to.
     /// * `config` - Connection, reconnection and keep-alive configuration.
     /// * `handler` - An implementation of [`WebSocketMessageHandler`] to handle received messages.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::InvalidRequest`] if the request cannot be connected: it is
+    /// not a valid request, its URL scheme is not `ws` or `wss`, it has no host, or it
+    /// is a `wss` URL and the crate is built without a TLS backend.
     pub fn new<R, S>(id: S, request: R, config: WebSocketConfig, handler: H) -> Result<Self, Error>
     where
         R: IntoClientRequest + Unpin,
@@ -166,10 +172,12 @@ where
         R: IntoClientRequest + Unpin,
         S: Into<String>,
     {
+        let request = request
+            .into_client_request()
+            .map_err(|e| Error::InvalidRequest(e.to_string()))?;
+        validate_request(&request)?;
         Ok(Self {
-            request: request
-                .into_client_request()
-                .map_err(|e| Error::InvalidRequest(e.to_string()))?,
+            request,
             id: id.into(),
             machine: Machine::new(CoreConfig::from(&config)),
             tls: TlsContext::new(&config),
@@ -403,6 +411,7 @@ where
             .as_str()
             .into_client_request()
             .map_err(|e| Error::InvalidRequest(format!("provider URL {url:?}: {e}")))?;
+        validate_request(&new_request)?;
         copy_headers(&self.request, &mut new_request, |_| true);
         if new_request.uri() != self.request.uri() {
             debug!("[{}] Using refreshed URL: {url}", self.id);
@@ -1610,6 +1619,65 @@ mod tests {
         assert!(matches!(result, Err(Error::InvalidRequest(_))));
         // the transport was never called with the invalid request
         assert!(attempts.lock().unwrap().is_empty());
+    }
+
+    /// Creates a client for `url` without starting it.
+    fn new_client(url: &str) -> Result<GenericWebSocketClient<TestHandler>, Error> {
+        GenericWebSocketClient::new("test", url, config(), TestHandler::default())
+    }
+
+    #[test]
+    fn new_rejects_a_url_that_is_not_a_websocket_url() {
+        for url in [
+            "http://example.com/ws",
+            "https://example.com/ws",
+            "ftp://example.com",
+        ] {
+            assert!(
+                matches!(new_client(url), Err(Error::InvalidRequest(_))),
+                "{url} can never be connected"
+            );
+        }
+        assert!(new_client("ws://example.com/ws").is_ok());
+    }
+
+    #[cfg(any(feature = "native-tls", feature = "rustls-platform-verifier"))]
+    #[test]
+    fn new_accepts_wss_with_a_tls_backend() {
+        assert!(new_client("wss://example.com/ws").is_ok());
+    }
+
+    #[cfg(not(any(feature = "native-tls", feature = "rustls-platform-verifier")))]
+    #[test]
+    fn new_rejects_wss_without_a_tls_backend() {
+        assert!(
+            matches!(
+                new_client("wss://example.com/ws"),
+                Err(Error::InvalidRequest(_))
+            ),
+            "wss:// can never be connected without a TLS backend"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn provider_url_that_is_not_a_websocket_url_fails_the_attempt() {
+        let (transport, attempts) = MockTransport::scripted(vec![]);
+        let addr = GenericWebSocketClient::with_transport(
+            "test",
+            "ws://localhost",
+            config(),
+            TestHandler::default(),
+            Box::new(transport),
+        )
+        .unwrap()
+        .with_url_provider(|| Some("http://localhost".into()))
+        .start();
+
+        let result = addr.send(Connect).await.unwrap();
+        assert!(matches!(result, Err(Error::InvalidRequest(_))));
+        // the transport was never called with the unusable request
+        assert!(attempts.lock().unwrap().is_empty());
+        addr.do_send(Disconnect);
     }
 
     // ========================================================================

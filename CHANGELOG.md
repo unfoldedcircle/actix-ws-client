@@ -40,6 +40,10 @@ _Changes in the next release_
   `Sec-WebSocket-Extensions` are forwarded. Before, only `Authorization` and `Cookie` were dropped. Another scheme
   or port is another origin now; the default port of the scheme is not.
 
+- A URL that can never be connected is rejected with `Error::InvalidRequest` when the client is created: a scheme
+  other than `ws` / `wss`, a missing host, or `wss` without a TLS backend. Before, every connection attempt failed
+  and was retried forever.
+
 ### Fixed
 - A header with several values keeps all of them on a redirect and on a URL refresh. Before, only the first value
   was kept.

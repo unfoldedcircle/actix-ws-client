@@ -30,7 +30,7 @@ The TLS backend for `wss://` connections is selected with cargo features:
 - If both features are enabled (cargo feature unification), `native-tls` is used
   unless a rustls configuration is passed with `tls_connector`.
 - With `default-features = false` and no TLS feature, only plain `ws://` connections
-  are possible.
+  are possible: a `wss://` URL is rejected when the client is created.
 
 TLS options of `WebSocketConfig`, working with both backends:
 
@@ -46,7 +46,9 @@ TLS options of `WebSocketConfig`, working with both backends:
 ## Public API
 
 - `GenericWebSocketClient::<H>::new(id, request, config, handler)` — construct the
-  actor; optionally chain `.with_url_provider(...)`; start it with `.start()`.
+  actor; optionally chain `.with_url_provider(...)`; start it with `.start()`. A
+  request that can never be connected (a scheme other than `ws` / `wss`, no host,
+  `wss` without a TLS backend) fails with `Error::InvalidRequest`.
 - Messages: `Connect`, `Disconnect` (close, stop reconnecting), `Close` (like
   `Disconnect`, with a close status code and reason), `Reconnect` (close, connect
   again at once with a fresh attempt counter), `Stop` (close, stop the actor),
