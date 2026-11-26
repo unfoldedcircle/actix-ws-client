@@ -37,8 +37,8 @@ use tokio_tungstenite::tungstenite::handshake::client::Request as WsRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig as WsProtocolConfig;
 use transport::{
-    BoxSink, BoxStream, ConnectOptions, Transport, TungsteniteTransport, message_from_frame,
-    validate_close,
+    BoxSink, BoxStream, ConnectOptions, Transport, TungsteniteTransport, copy_headers,
+    message_from_frame, validate_close,
 };
 use writer::WriteItem;
 
@@ -403,13 +403,7 @@ where
             .as_str()
             .into_client_request()
             .map_err(|e| Error::InvalidRequest(format!("provider URL {url:?}: {e}")))?;
-        for (name, value) in self.request.headers() {
-            if !new_request.headers().contains_key(name) {
-                new_request
-                    .headers_mut()
-                    .insert(name.clone(), value.clone());
-            }
-        }
+        copy_headers(&self.request, &mut new_request, |_| true);
         if new_request.uri() != self.request.uri() {
             debug!("[{}] Using refreshed URL: {url}", self.id);
         }

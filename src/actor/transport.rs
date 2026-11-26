@@ -21,9 +21,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::UrlError;
 use tokio_tungstenite::tungstenite::handshake::client::{Request as WsRequest, generate_key};
 use tokio_tungstenite::tungstenite::http::header::{
-    AUTHORIZATION, COOKIE, LOCATION, SEC_WEBSOCKET_KEY,
+    HeaderName, LOCATION, ORIGIN, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_KEY,
+    SEC_WEBSOCKET_PROTOCOL, USER_AGENT,
 };
-use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
+use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode, Uri};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig as WsProtocolConfig;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
@@ -244,11 +245,24 @@ fn is_redirect(status: StatusCode) -> bool {
     matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
 }
 
+/// Headers of the user that are forwarded to another origin. Everything else may be
+/// a credential — `Authorization`, `Cookie`, or a custom header like `X-Api-Key`.
+const CROSS_ORIGIN_HEADERS: [HeaderName; 4] = [
+    ORIGIN,
+    SEC_WEBSOCKET_EXTENSIONS,
+    SEC_WEBSOCKET_PROTOCOL,
+    USER_AGENT,
+];
+
 /// Builds the request for a redirect target.
 ///
 /// Supports absolute (`ws://`, `wss://`, `http://`, `https://`), scheme-relative
-/// (`//host/path`) and absolute-path (`/path`) Location values. On a cross-origin
-/// redirect, hop-sensitive headers (`Authorization`, `Cookie`) are **not** forwarded.
+/// (`//host/path`) and absolute-path (`/path`) Location values.
+///
+/// - A redirect from `wss://` to a plain text target is refused: it would take the
+///   connection, and on the same host also the credentials, out of TLS.
+/// - On a redirect to another origin (scheme, host or port differ), only the headers
+///   in [`CROSS_ORIGIN_HEADERS`] are forwarded.
 fn build_redirect_request(current: &WsRequest, location: &str) -> Result<WsRequest, Error> {
     let current_uri = current.uri();
     let scheme = current_uri.scheme_str().unwrap_or("ws");
@@ -279,24 +293,55 @@ fn build_redirect_request(current: &WsRequest, location: &str) -> Result<WsReque
         .into_client_request()
         .map_err(|e| Error::InvalidRequest(e.to_string()))?;
 
-    let cross_origin = current_uri.authority() != new_request.uri().authority();
-
-    // Preserve original headers; don't overwrite ones tungstenite generated, and
-    // don't leak credentials to a different origin.
-    for (name, value) in current.headers() {
-        if new_request.headers().contains_key(name) {
-            continue;
-        }
-        if cross_origin && (name == AUTHORIZATION || name == COOKIE) {
-            debug!("Dropping {name} header on cross-origin redirect");
-            continue;
-        }
-        new_request
-            .headers_mut()
-            .insert(name.clone(), value.clone());
+    if scheme == "wss" && new_request.uri().scheme_str() != Some("wss") {
+        return Err(Error::WebSocket(
+            "Redirect from wss:// to an unencrypted target refused".into(),
+        ));
     }
 
+    let cross_origin = origin(current_uri) != origin(new_request.uri());
+    copy_headers(current, &mut new_request, |name| {
+        let forward = !cross_origin || CROSS_ORIGIN_HEADERS.contains(name);
+        if !forward {
+            debug!("Dropping {name} header on cross-origin redirect");
+        }
+        forward
+    });
+
     Ok(new_request)
+}
+
+/// The origin of a WebSocket URL: scheme, host in lower case, and port — the default
+/// port of the scheme if the URL has none.
+fn origin(uri: &Uri) -> (Option<&str>, Option<String>, Option<u16>) {
+    let scheme = uri.scheme_str();
+    let port = uri.port_u16().or(match scheme {
+        Some("wss") => Some(443),
+        Some("ws") => Some(80),
+        _ => None,
+    });
+    (scheme, uri.host().map(str::to_ascii_lowercase), port)
+}
+
+/// Copies the headers of `from` that pass `forward` to the request `to`, with all of
+/// their values.
+///
+/// Headers that `to` has already are left alone: they were created for its target
+/// (`Host`, the handshake headers).
+pub(crate) fn copy_headers(
+    from: &WsRequest,
+    to: &mut WsRequest,
+    mut forward: impl FnMut(&HeaderName) -> bool,
+) {
+    let created: Vec<HeaderName> = to.headers().keys().cloned().collect();
+    for name in from.headers().keys() {
+        if created.contains(name) || !forward(name) {
+            continue;
+        }
+        for value in from.headers().get_all(name) {
+            to.headers_mut().append(name.clone(), value.clone());
+        }
+    }
 }
 
 // ============================================================================
@@ -359,7 +404,7 @@ pub(crate) fn message_from_frame(frame: Frame) -> Message {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use tokio_tungstenite::tungstenite::http::HeaderValue;
+    use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, COOKIE};
 
     fn request(url: &str) -> WsRequest {
         url.into_client_request().unwrap()
@@ -436,19 +481,6 @@ mod tests {
     fn unsupported_relative_redirect_is_rejected() {
         let req = request("ws://example.com/old");
         assert!(build_redirect_request(&req, "relative/path").is_err());
-    }
-
-    #[test]
-    fn cross_origin_redirect_drops_credentials() {
-        let mut req = request("ws://example.com/socket");
-        req.headers_mut()
-            .insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
-        req.headers_mut()
-            .insert("x-custom", HeaderValue::from_static("kept"));
-
-        let new = build_redirect_request(&req, "ws://other.example.com/ws").unwrap();
-        assert!(new.headers().get(AUTHORIZATION).is_none());
-        assert_eq!(new.headers().get("x-custom").unwrap(), "kept");
     }
 
     #[test]
