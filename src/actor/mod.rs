@@ -1693,4 +1693,57 @@ mod tests {
             "the actor must stop: nothing may keep it alive"
         );
     }
+
+    // ------------------------------------------------------------------
+    // Actor lifecycle
+    // ------------------------------------------------------------------
+
+    /// Whether the actor is gone: it owns the second reference to the handler's log.
+    fn actor_stopped(handler: &TestHandler) -> bool {
+        Arc::strong_count(&handler.log) == 1
+    }
+
+    #[actix_rt::test]
+    async fn dropping_the_last_address_closes_a_connected_client() {
+        tokio::time::pause();
+        let (sink, sent) = mock_sink(usize::MAX);
+        let (_script, stream) = scripted_stream();
+        let (transport, _) = MockTransport::scripted(vec![Ok((sink, stream))]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        addr.send(Connect).await.unwrap().unwrap();
+
+        drop(addr);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            actor_stopped(&handler),
+            "a client nobody can reach anymore must not stay connected"
+        );
+        // The connection is closed gracefully, with the usual callbacks.
+        assert!(sent_contains(&sent, is_close));
+        assert!(handler.log_contains("closed:ClosedLocally"));
+        assert_eq!(handler.count("disconnected"), 1);
+    }
+
+    #[actix_rt::test]
+    async fn dropping_the_last_address_stops_a_reconnecting_client() {
+        tokio::time::pause();
+        // Every connection attempt fails.
+        let (transport, attempts) = MockTransport::scripted(vec![]);
+        let handler = TestHandler::default();
+        let addr = client(transport, handler.clone());
+        assert!(addr.send(Connect).await.unwrap().is_err());
+
+        drop(addr);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let attempts_at_drop = attempts.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        assert!(
+            actor_stopped(&handler),
+            "a client nobody can reach anymore must not keep reconnecting"
+        );
+        assert_eq!(attempts.lock().unwrap().len(), attempts_at_drop);
+    }
 }
