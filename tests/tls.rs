@@ -383,3 +383,49 @@ async fn tls12_only_server_is_supported() {
 
     assert_echo(&client, &handler).await;
 }
+
+/// The PEM of a certificate authority that has nothing to do with the server.
+fn unrelated_ca_pem() -> String {
+    let (from_year, to_year) = validity();
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.not_before = date_time_ymd(from_year, 1, 1);
+    params.not_after = date_time_ymd(to_year, 12, 31);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "unrelated test CA");
+    params.self_signed(&key).unwrap().pem()
+}
+
+/// A PEM file often holds several certificates: every one of them is trusted, not
+/// only the first.
+#[actix_rt::test]
+async fn every_certificate_of_a_pem_bundle_is_trusted() {
+    let server = spawn_tls_echo_server().await;
+    let bundle = format!("{}\n{}", unrelated_ca_pem(), server.ca_pem);
+    let handler = RecordingHandler::default();
+    let config = config()
+        .add_root_certificate(Certificate::from_pem(bundle))
+        .build()
+        .unwrap();
+    let client = start_client(&server.url, config, handler.clone());
+
+    assert_echo(&client, &handler).await;
+}
+
+#[actix_rt::test]
+async fn pem_without_a_certificate_fails_the_connect_with_a_tls_error() {
+    let server = spawn_tls_echo_server().await;
+    let handler = RecordingHandler::default();
+    let config = config()
+        .add_root_certificate(Certificate::from_pem("no certificate in here"))
+        .build()
+        .unwrap();
+    let client = start_client(&server.url, config, handler.clone());
+
+    let result = client.send(Connect).await.unwrap();
+
+    assert!(matches!(result, Err(Error::Tls(_))), "got: {result:?}");
+}

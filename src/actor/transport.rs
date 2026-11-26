@@ -531,10 +531,77 @@ mod tests {
         assert_eq!(new.uri().host(), Some("other.example.com"));
     }
 
+    /// The target of a redirect as the server may write it (RFC 9110 §10.2.2: any
+    /// URI reference).
+    fn redirect_target(current: &str, location: &str) -> String {
+        build_redirect_request(&request(current), location)
+            .unwrap()
+            .uri()
+            .to_string()
+    }
+
     #[test]
-    fn unsupported_relative_redirect_is_rejected() {
+    fn scheme_of_a_redirect_is_not_case_sensitive() {
+        let current = "ws://example.com/old";
+        assert_eq!(
+            redirect_target(current, "WS://other.example/x"),
+            "ws://other.example/x"
+        );
+        assert_eq!(
+            redirect_target(current, "WSS://other.example/x"),
+            "wss://other.example/x"
+        );
+        assert_eq!(
+            redirect_target(current, "HTTP://other.example/x"),
+            "ws://other.example/x"
+        );
+        assert_eq!(
+            redirect_target(current, "Https://other.example/x"),
+            "wss://other.example/x"
+        );
+    }
+
+    #[test]
+    fn relative_redirect_is_resolved_against_the_current_url() {
+        let current = "ws://example.com:8080/api/v1/socket?old=1";
+        assert_eq!(
+            redirect_target(current, "other"),
+            "ws://example.com:8080/api/v1/other"
+        );
+        assert_eq!(
+            redirect_target(current, "./other?x=1"),
+            "ws://example.com:8080/api/v1/other?x=1"
+        );
+        assert_eq!(
+            redirect_target(current, "../v2/socket"),
+            "ws://example.com:8080/api/v2/socket"
+        );
+        assert_eq!(
+            redirect_target(current, "../../../../socket"),
+            "ws://example.com:8080/socket"
+        );
+        assert_eq!(
+            redirect_target(current, "?token=new"),
+            "ws://example.com:8080/api/v1/socket?token=new"
+        );
+        // Without a path the base is the root.
+        assert_eq!(
+            redirect_target("ws://example.com", "other"),
+            "ws://example.com/other"
+        );
+        // A fragment is of no use for a request.
+        assert_eq!(
+            redirect_target(current, "other#section"),
+            "ws://example.com:8080/api/v1/other"
+        );
+    }
+
+    #[test]
+    fn redirect_to_another_protocol_is_rejected() {
         let req = request("ws://example.com/old");
-        assert!(build_redirect_request(&req, "relative/path").is_err());
+        assert!(build_redirect_request(&req, "ftp://example.com/file").is_err());
+        assert!(build_redirect_request(&req, "mailto:someone@example.com").is_err());
+        assert!(build_redirect_request(&req, "").is_err());
     }
 
     #[test]
@@ -651,10 +718,14 @@ mod tests {
     fn redirect_error_does_not_contain_url_secrets() {
         let req = request("ws://example.com/socket");
 
-        let error = build_redirect_request(&req, "relative/path?token=token-4713").unwrap_err();
+        let error =
+            build_redirect_request(&req, "ftp://example.com/file?token=token-4713").unwrap_err();
 
         assert!(!error.to_string().contains("token-4713"), "{error}");
-        assert!(error.to_string().contains("relative/path"), "{error}");
+        assert!(
+            error.to_string().contains("ftp://example.com/file"),
+            "{error}"
+        );
     }
 
     #[test]
