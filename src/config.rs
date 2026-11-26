@@ -267,3 +267,111 @@ impl WebSocketConfigBuilder {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn builder() -> WebSocketConfigBuilder {
+        WebSocketConfig::builder()
+    }
+
+    /// The reason the builder gives for rejecting a configuration.
+    fn rejected(builder: WebSocketConfigBuilder) -> String {
+        builder
+            .build()
+            .expect_err("the configuration must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn default_configuration_is_valid() {
+        let config = builder().build().unwrap();
+        assert_eq!(config.connect_timeout, Duration::from_secs(10));
+        assert_eq!(config.initial_backoff, Duration::from_millis(500));
+        assert_eq!(config.max_backoff, Duration::from_secs(30));
+        assert_eq!(config.max_send_queue, None);
+        assert_eq!(config.max_message_size, None);
+    }
+
+    #[test]
+    fn existing_rules_are_enforced() {
+        assert!(rejected(builder().backoff_factor(0.5)).contains("backoff_factor"));
+        assert!(rejected(builder().backoff_factor(f64::NAN)).contains("backoff_factor"));
+        assert!(rejected(builder().max_missed_pongs(0u32)).contains("max_missed_pongs"));
+        assert!(rejected(builder().ping_interval(Duration::ZERO)).contains("ping_interval"));
+        assert!(rejected(builder().max_send_queue(0usize)).contains("max_send_queue"));
+        assert!(rejected(builder().initial_backoff(Duration::ZERO)).contains("initial_backoff"));
+    }
+
+    /// Without a delay between the attempts the client spins.
+    #[test]
+    fn backoff_that_gives_no_delay_is_rejected() {
+        assert!(rejected(builder().max_backoff(Duration::ZERO)).contains("max_backoff"));
+        assert!(
+            rejected(builder().initial_backoff(Duration::from_micros(999)))
+                .contains("initial_backoff")
+        );
+        assert!(
+            builder()
+                .initial_backoff(Duration::from_millis(1))
+                .build()
+                .is_ok()
+        );
+    }
+
+    /// The cap would silently replace the initial delay.
+    #[test]
+    fn max_backoff_below_the_initial_backoff_is_rejected() {
+        let config = builder()
+            .initial_backoff(Duration::from_secs(5))
+            .max_backoff(Duration::from_secs(1));
+        assert!(rejected(config).contains("max_backoff"));
+
+        let equal = builder()
+            .initial_backoff(Duration::from_secs(5))
+            .max_backoff(Duration::from_secs(5));
+        assert!(equal.build().is_ok());
+        // The default cap also counts.
+        assert!(
+            rejected(builder().initial_backoff(Duration::from_secs(31))).contains("max_backoff")
+        );
+    }
+
+    /// Every attempt would time out.
+    #[test]
+    fn zero_connect_timeout_is_rejected() {
+        assert!(rejected(builder().connect_timeout(Duration::ZERO)).contains("connect_timeout"));
+    }
+
+    /// Every message would be rejected, followed by a reconnect.
+    #[test]
+    fn zero_size_limits_are_rejected() {
+        assert!(rejected(builder().max_message_size(0usize)).contains("max_message_size"));
+        assert!(rejected(builder().max_frame_size(0usize)).contains("max_frame_size"));
+    }
+
+    #[test]
+    fn frame_limit_above_the_message_limit_is_rejected() {
+        let config = builder()
+            .max_message_size(1024usize)
+            .max_frame_size(2048usize);
+        assert!(rejected(config).contains("max_frame_size"));
+
+        assert!(
+            builder()
+                .max_message_size(2048usize)
+                .max_frame_size(1024usize)
+                .build()
+                .is_ok()
+        );
+        // One limit alone is fine: the other one keeps the transport default.
+        assert!(builder().max_message_size(1024usize).build().is_ok());
+    }
+
+    /// Not waiting for the server is a valid choice.
+    #[test]
+    fn zero_close_timeout_is_accepted() {
+        assert!(builder().close_timeout(Duration::ZERO).build().is_ok());
+    }
+}

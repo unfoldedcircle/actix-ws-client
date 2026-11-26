@@ -117,4 +117,35 @@ mod tests {
         };
         assert_eq!(backoff(5, &cfg, 0.0), Duration::from_millis(500));
     }
+
+    /// The delay must not be cut to whole milliseconds: a short delay became zero.
+    #[test]
+    fn sub_millisecond_delay_is_kept() {
+        let cfg = BackoffCfg {
+            initial: Duration::from_micros(500),
+            max: Duration::from_secs(30),
+            factor: 2.0,
+        };
+        assert_eq!(backoff(1, &cfg, 0.0), Duration::from_micros(500));
+        assert_eq!(backoff(2, &cfg, 0.0), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn extreme_values_do_not_overflow() {
+        let cfg = BackoffCfg {
+            initial: Duration::MAX,
+            max: Duration::MAX,
+            factor: f64::MAX,
+        };
+        for attempt in [1, 2, u32::MAX] {
+            let delay = backoff(attempt, &cfg, 0.0);
+            assert!(delay > Duration::from_secs(u64::MAX / 2));
+        }
+        let cfg = BackoffCfg {
+            initial: Duration::from_millis(500),
+            max: Duration::from_secs(30),
+            factor: f64::MAX,
+        };
+        assert_eq!(backoff(u32::MAX, &cfg, 0.0), cfg.max);
+    }
 }
